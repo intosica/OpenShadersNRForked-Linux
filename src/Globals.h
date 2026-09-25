@@ -6,6 +6,11 @@
 
 #include <RE/Skyrim.h>
 
+using Matrix = DirectX::XMFLOAT4X4;
+using Vector2 = DirectX::XMFLOAT2;
+using Vector3 = DirectX::XMFLOAT3;
+using Vector4 = DirectX::XMFLOAT4;
+
 struct CloudShadows;
 struct CloudRelight;
 struct DynamicCubemaps;

@@ -1531,7 +1531,13 @@ void EditorWindow::Draw()
 			auto& framebuffer = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kFRAMEBUFFER];
 			if (framebuffer.SRV) {
 				ID3D11Resource* resource = nullptr;
-				framebuffer.SRV->GetResource(&resource);
+				// framebuffer.SRV is CommonLibVR's REX::W32::ID3D11ShaderResourceView, a
+				// separate (but ABI-identical) mirror of the real D3D11 COM interface, so
+				// GetResource() wants a REX::W32::ID3D11Resource**. Everything downstream
+				// here (static_cast to ID3D11Texture2D*, CopyResource, CreateSRV) expects
+				// the real native type, so we only cast at this one boundary call rather
+				// than switching the local variable's type.
+				framebuffer.SRV->GetResource(reinterpret_cast<REX::W32::ID3D11Resource**>(&resource));
 
 				if (resource) {
 					auto texture = static_cast<ID3D11Texture2D*>(resource);
@@ -1550,7 +1556,8 @@ void EditorWindow::Draw()
 						tempTexture = nullptr;
 
 						D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc{};
-						framebuffer.SRV->GetDesc(&srvDesc);
+						// Same REX::W32 vs. native mismatch as GetResource() above.
+						framebuffer.SRV->GetDesc(reinterpret_cast<REX::W32::D3D11_SHADER_RESOURCE_VIEW_DESC*>(&srvDesc));
 
 						tempTexture = new Texture2D(texDesc);
 						tempTexture->CreateSRV(srvDesc);

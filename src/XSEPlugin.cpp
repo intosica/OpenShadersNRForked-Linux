@@ -1,0 +1,246 @@
+#include "Compatibility.h"
+#include "Deferred.h"
+#include "Features/Upscaling.h"
+#include "FrameAnnotations.h"
+#include "Globals.h"
+#include "Hooks.h"
+#include "I18n/I18n.h"
+#include "Menu.h"
+#include "Menu/ThemeManager.h"
+#include "SceneSettingsManager.h"
+#include "ShaderCache.h"
+#include "State.h"
+#include "VRAPI/CSpluginapi.h"
+
+#define DLLEXPORT __declspec(dllexport)
+
+std::list<std::string> errors;
+
+bool Load();
+
+void InitializeLog([[maybe_unused]] spdlog::level::level_enum a_level = spdlog::level::info)
+{
+#ifndef NDEBUG
+	auto sink = std::make_shared<spdlog::sinks::msvc_sink_mt>();
+#else
+	auto path = logger::log_directory();
+	if (!path) {
+		util::report_and_fail("Failed to find standard logging directory"sv);
+	}
+
+	*path /= std::format("{}.log"sv, Plugin::NAME);
+	auto sink = std::make_shared<spdlog::sinks::basic_file_sink_mt>(path->string(), true);
+#endif
+
+#ifndef NDEBUG
+	const auto level = spdlog::level::trace;
+#else
+	const auto level = a_level;
+#endif
+
+	auto log = std::make_shared<spdlog::logger>("global log"s, std::move(sink));
+	log->set_level(level);
+	log->flush_on(spdlog::level::info);
+
+	spdlog::set_default_logger(std::move(log));
+	spdlog::set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%l] [%t] [%s:%#] %v");
+}
+
+extern "C" DLLEXPORT bool SKSEAPI SKSEPlugin_Load(const SKSE::LoadInterface* a_skse)
+{
+#ifndef NDEBUG
+	while (!REX::W32::IsDebuggerPresent()) {};
+#endif
+	InitializeLog();
+	logger::info("Loaded {} {}", Plugin::NAME, Plugin::VERSION.string());
+	SKSE::Init(a_skse);
+	SKSE::AllocTrampoline(1 << 12);
+	return Load();
+}
+
+extern "C" DLLEXPORT constinit auto SKSEPlugin_Version = []() noexcept {
+	SKSE::PluginVersionData v;
+	v.PluginName(Plugin::NAME.data());
+	v.PluginVersion(Plugin::VERSION);
+	v.UsesAddressLibrary();
+	v.UsesNoStructs();
+	return v;
+}();
+
+extern "C" DLLEXPORT bool SKSEAPI SKSEPlugin_Query(const SKSE::QueryInterface*, SKSE::PluginInfo* pluginInfo)
+{
+	pluginInfo->name = SKSEPlugin_Version.pluginName;
+	pluginInfo->infoVersion = SKSE::PluginInfo::kVersion;
+	pluginInfo->version = SKSEPlugin_Version.pluginVersion;
+	return true;
+}
+
+void MessageHandler(SKSE::MessagingInterface::Message* message)
+{
+	switch (message->type) {
+	case SKSE::MessagingInterface::kPostLoad:
+		{
+			// Null sender: consumer plugins dispatch the interface request to us by name.
+			auto messaging = SKSE::GetMessagingInterface();
+			if (!messaging || !messaging->RegisterListener(nullptr, CSPluginAPI::ModMessageHandler))
+				logger::error("Failed to register Community Shaders API message listener");
+			else
+				logger::info("Registered Community Shaders API message listener during PostLoad");
+
+			break;
+		}
+	case SKSE::MessagingInterface::kPostPostLoad:
+		{
+			if (errors.empty()) {
+				Deferred::Hooks::Install();
+				Hooks::Install();
+				EngineFix::InstallOnPostPostLoadFixes();
+				FrameAnnotations::OnPostPostLoad();
+
+				auto shaderCache = globals::shaderCache;
+
+				// Run feature PostPostLoad() first so features can disable themselves if needed
+				Feature::ForEachLoadedFeature("PostPostLoad", [](Feature* feature) { feature->PostPostLoad(); });
+
+				// Register scene settings event handler (Interior Only transitions)
+				SceneSettingsManager::MenuOpenCloseEventHandler::Register();
+
+				// Now validate disk cache after features have had a chance to modify their state
+				shaderCache->ValidateDiskCache();
+
+				if (shaderCache->UseFileWatcher())
+					shaderCache->StartFileWatcher();
+			}
+
+			break;
+		}
+	case SKSE::MessagingInterface::kDataLoaded:
+		{
+			for (auto it = errors.begin(); it != errors.end(); ++it) {
+				auto& errorMessage = *it;
+				RE::DebugMessageBox(std::format("Open Shaders\n{}\nAll hooks and features are disabled.", errorMessage).c_str());
+			}
+
+			if (errors.empty()) {
+				globals::OnDataLoaded();
+				EngineFix::InstallOnDataLoadedFixes();
+				FrameAnnotations::OnDataLoaded();
+
+				auto shaderCache = globals::shaderCache;
+				shaderCache->menuLoaded = true;
+
+				while (shaderCache->IsCompiling() && !shaderCache->backgroundCompilation && !globals::game::quitGame) {
+					std::this_thread::sleep_for(100ms);
+				}
+
+				if (globals::game::quitGame) {
+					logger::info("Game was closed, skipping feature DataLoaded methods");
+					break;
+				}
+
+				if (shaderCache->HasFeatureSetChanges()) {
+					shaderCache->CommitFeatureSetChange();
+				} else if (shaderCache->IsDiskCacheActive()) {
+					shaderCache->WriteDiskCacheInfo();
+				}
+
+				Feature::ForEachLoadedFeature("DataLoaded", [](Feature* feature) { feature->DataLoaded(); });
+				globals::state->startupMenuInitializationComplete.store(true, std::memory_order_release);
+			}
+
+			break;
+		}
+	case SKSE::MessagingInterface::kPostLoadGame:
+		{
+			if (errors.empty())
+				Feature::ForEachLoadedFeature("GameLoaded", [](Feature* feature) { feature->GameLoaded(); });
+			break;
+		}
+	}
+}
+
+bool Load()
+{
+	if (REL::Module::IsVR()) {  // Pre-ReInit check; globals::game::isVR not populated yet
+		// Floor covers 0.238.0's BSShadowLight::ctor (100810) / BSLight::IsInRange
+		// (101299) and 0.250.0's SetBackHemisphereAccumulator (101600, guarded by
+		// ShadowParabolicNullAccumulatorFix against a vanilla null-this crash).
+		REL::IDDB::get().IsVRAddressLibraryAtLeastVersion("0.250.0", true);
+	}
+
+	auto privateProfileRedirectorVersion = Util::GetDllVersion(L"Data/SKSE/Plugins/PrivateProfileRedirector.dll");
+	if (privateProfileRedirectorVersion.has_value() && privateProfileRedirectorVersion.value().compare(REL::Version(0, 6, 2)) == std::strong_ordering::less) {
+		stl::report_and_fail("Old version of PrivateProfileRedirector detected, 0.6.2+ required if using it."sv);
+	}
+
+	// Frame generation is flatrim-only; the DRS reset must precede any D3D device.
+	if (!REL::Module::IsVR())
+		Streamline::EnsureDriverProfileAllowsDLSSG();
+
+	auto messaging = SKSE::GetMessagingInterface();
+	messaging->RegisterListener("SKSE", MessageHandler);
+
+	globals::OnInit();
+	globals::ReInit();
+
+	auto state = globals::state;
+
+	// Initialize i18n system (loads English fallback and discovers available locales)
+	I18n::GetSingleton()->Init();
+
+	state->Load();
+	state->LoadTheme();  // Load theme settings from SettingsTheme.json
+
+	// Initialize theme system - create default themes and discover existing ones
+	globals::menu->CreateDefaultThemes();  // Creates JSON files if they don't exist
+	auto themeManager = ThemeManager::GetSingleton();
+	themeManager->DiscoverThemes();  // Discover all available themes
+
+	auto log = spdlog::default_logger();
+	log->set_level(state->GetLogLevel());
+
+	for (const auto& plugin : Compatibility::incompatiblePlugins) {
+		if (LoadLibrary(plugin.dll)) {
+			auto dllName = stl::utf16_to_utf8(plugin.dll).value_or("<unicode conversion error>"s);
+			auto errorMessage = plugin.reason.empty() ?
+			                        std::format("Incompatible DLL {} detected. Remove it to use Open Shaders.", dllName) :
+			                        std::format("Incompatible DLL {} detected ({}). Remove it to use Open Shaders.", dllName, plugin.reason);
+			logger::error("{}", errorMessage);
+			errors.push_back(errorMessage);
+		}
+	}
+
+	auto pushMissingDllError = [&](std::string_view dllName) {
+		auto errorMessage = std::format("Required DLL {} was missing. Install it to use Open Shaders.", dllName);
+		logger::error("{}", errorMessage);
+		errors.push_back(errorMessage);
+	};
+
+	// Engine Fixes: VR accepts either EngineFixesVR.dll or the EngineFixes.dll NG
+	if (globals::game::isVR) {
+		if (!LoadLibrary(L"Data/SKSE/Plugins/EngineFixesVR.dll") && !LoadLibrary(L"Data/SKSE/Plugins/EngineFixes.dll")) {
+			pushMissingDllError("EngineFixesVR.dll or EngineFixes.dll");
+		}
+	} else {
+		if (!LoadLibrary(L"Data/SKSE/Plugins/EngineFixes.dll")) {
+			pushMissingDllError(stl::utf16_to_utf8(L"Data/SKSE/Plugins/EngineFixes.dll").value_or("<unicode conversion error>"s));
+		}
+	}
+
+	// Empty RequiredDLLs array, if necessary we can add a dll here in the future without needing to modify the plugin loading logic.
+	const std::array<LPCWSTR, 0> requiredDLLs{};
+
+	for (const auto dll : requiredDLLs) {
+		if (!LoadLibrary(dll)) {
+			pushMissingDllError(stl::utf16_to_utf8(dll).value_or("<unicode conversion error>"s));
+		}
+	}
+
+	if (errors.empty()) {
+		Hooks::InstallEarlyHooks();
+		logger::info("Calling feature Load methods");
+		Feature::ForEachLoadedFeature("Load", [](Feature* feature) { feature->Load(); });
+	}
+
+	return true;
+}

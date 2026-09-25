@@ -1,0 +1,434 @@
+#pragma once
+
+#include <d3d11.h>
+#include <string>
+
+#include <Windows.Foundation.h>
+#include <stdio.h>
+#include <winrt/base.h>
+#include <wrl\client.h>
+#include <wrl\wrappers\corewrappers.h>
+
+// Forward declaration — keeps Buffer.h free of Utils/D3D.h's game-type dependencies
+namespace Util
+{
+	void SetResourceName(ID3D11DeviceChild* Resource, const char* Format, ...);
+}
+
+namespace detail
+{
+	inline void SetD3DName(ID3D11DeviceChild* resource, const std::string& name, const char* suffix = nullptr)
+	{
+		if (!resource || name.empty())
+			return;
+		if (suffix)
+			Util::SetResourceName(resource, "%s%s", name.c_str(), suffix);
+		else
+			Util::SetResourceName(resource, "%s", name.c_str());
+	}
+}
+
+#define STATIC_ASSERT_ALIGNAS_16(structName) \
+	static_assert(sizeof(structName) % 16 == 0, #structName " is not a multiple of 16.");
+
+/** @brief Creates a D3D11 buffer descriptor for a structured buffer with the given element count. */
+template <typename T>
+D3D11_BUFFER_DESC StructuredBufferDesc(uint64_t count, bool uav = true, bool dynamic = false)
+{
+	D3D11_BUFFER_DESC desc{};
+	desc.Usage = (uav || !dynamic) ? D3D11_USAGE_DEFAULT : D3D11_USAGE_DYNAMIC;
+	desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+	if (uav)
+		desc.BindFlags |= D3D11_BIND_UNORDERED_ACCESS;
+	desc.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+	desc.CPUAccessFlags = !dynamic ? 0 : D3D11_CPU_ACCESS_WRITE;
+	desc.StructureByteStride = sizeof(T);
+	desc.ByteWidth = (UINT)(sizeof(T) * count);
+	return desc;
+}
+
+/** @brief Rounds a buffer size up to the next 64-byte boundary for constant buffer alignment. */
+static constexpr std::uint32_t GetCBufferSize(std::uint32_t buffer_size)
+{
+	return (buffer_size + (64 - 1)) & ~(64 - 1);
+}
+
+/** @brief Creates a D3D11 buffer descriptor for a constant buffer of the given byte size. */
+inline D3D11_BUFFER_DESC ConstantBufferDesc(uint32_t size, bool dynamic = true)
+{
+	D3D11_BUFFER_DESC desc{};
+	ZeroMemory(&desc, sizeof(desc));
+	desc.Usage = dynamic ? D3D11_USAGE_DYNAMIC : D3D11_USAGE_DEFAULT;
+	desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+	desc.CPUAccessFlags = dynamic ? D3D11_CPU_ACCESS_WRITE : 0;
+	desc.ByteWidth = GetCBufferSize(size);
+	return desc;
+}
+
+/** @brief Creates a D3D11 constant buffer descriptor sized for type T. */
+template <typename T>
+D3D11_BUFFER_DESC ConstantBufferDesc(bool dynamic = true)
+{
+	return ConstantBufferDesc(sizeof(T), dynamic);
+}
+
+/** @brief RAII wrapper around a D3D11 constant buffer with map/update support. */
+class ConstantBuffer
+{
+public:
+	explicit ConstantBuffer(D3D11_BUFFER_DESC const& a_desc, const char* name = nullptr) :
+		desc(a_desc)
+	{
+		auto device = globals::d3d::device;
+		DX::ThrowIfFailed(device->CreateBuffer(&desc, nullptr, resource.put()));
+		if (name)
+			detail::SetD3DName(resource.get(), name);
+	}
+
+	/** @brief Gets the underlying ID3D11Buffer pointer. */
+	ID3D11Buffer* CB() const { return resource.get(); }
+
+	/**
+	 * @brief Uploads data to the constant buffer.
+	 * @param src_data Pointer to source data.
+	 * @param data_size Size in bytes to copy.
+	 */
+	void Update(void const* src_data, size_t data_size)
+	{
+		auto ctx = globals::d3d::context;
+		if (desc.Usage == D3D11_USAGE_DYNAMIC) {
+			D3D11_MAPPED_SUBRESOURCE mapped_buffer{};
+			ZeroMemory(&mapped_buffer, sizeof(D3D11_MAPPED_SUBRESOURCE));
+			DX::ThrowIfFailed(ctx->Map(resource.get(), 0u, D3D11_MAP_WRITE_DISCARD, 0u, &mapped_buffer));
+			memcpy(mapped_buffer.pData, src_data, data_size);
+			ctx->Unmap(resource.get(), 0);
+		} else
+			ctx->UpdateSubresource(resource.get(), 0, nullptr, src_data, 0, 0);
+	}
+
+	/** @brief Uploads a typed value to the constant buffer. */
+	template <typename T>
+	void Update(T const& src_data)
+	{
+		Update(&src_data, sizeof(T));
+	}
+
+private:
+	winrt::com_ptr<ID3D11Buffer> resource;
+	D3D11_BUFFER_DESC desc;
+};
+
+/** @brief Creates a D3D11 structured buffer descriptor with optional CPU write access. */
+template <typename T>
+D3D11_BUFFER_DESC StructuredBufferDesc(UINT a_count = 1, bool cpu_access = true)
+{
+	D3D11_BUFFER_DESC desc{};
+	ZeroMemory(&desc, sizeof(desc));
+	desc.Usage = cpu_access ? D3D11_USAGE_DYNAMIC : D3D11_USAGE_DEFAULT;
+	desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+	if (!cpu_access)
+		desc.BindFlags = desc.BindFlags | D3D11_BIND_UNORDERED_ACCESS;
+	desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+	desc.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+	desc.StructureByteStride = sizeof(T);
+	desc.ByteWidth = sizeof(T) * a_count;
+	return desc;
+}
+
+/** @brief RAII wrapper around a D3D11 structured buffer with SRV/UAV view management. */
+class StructuredBuffer
+{
+public:
+	StructuredBuffer(D3D11_BUFFER_DESC const& a_desc, UINT a_count, const char* name = nullptr) :
+		desc(a_desc), count(a_count)
+	{
+		auto device = globals::d3d::device;
+		DX::ThrowIfFailed(device->CreateBuffer(&desc, nullptr, resource.put()));
+		if (name) {
+			name_ = name;
+			detail::SetD3DName(resource.get(), name_);
+		}
+	}
+
+	/** @brief Gets the SRV at the given index. */
+	ID3D11ShaderResourceView* SRV(size_t i = 0) const { return srvs[i].get(); }
+	/** @brief Gets the UAV at the given index. */
+	ID3D11UnorderedAccessView* UAV(size_t i = 0) const { return uavs[i].get(); }
+
+	/** @brief Creates and appends a shader resource view for this buffer. */
+	virtual void CreateSRV()
+	{
+		auto device = globals::d3d::device;
+		D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc{};
+		srv_desc.Format = DXGI_FORMAT_UNKNOWN;
+		srv_desc.ViewDimension = D3D11_SRV_DIMENSION_BUFFEREX;
+		srv_desc.Buffer.FirstElement = 0;
+		srv_desc.Buffer.NumElements = count;
+		winrt::com_ptr<ID3D11ShaderResourceView> srv;
+		DX::ThrowIfFailed(device->CreateShaderResourceView(resource.get(), &srv_desc, srv.put()));
+		detail::SetD3DName(srv.get(), name_, " SRV");
+		srvs.push_back(srv);
+	}
+
+	/** @brief Creates and appends an unordered access view for this buffer. */
+	virtual void CreateUAV()
+	{
+		auto device = globals::d3d::device;
+		D3D11_UNORDERED_ACCESS_VIEW_DESC uav_desc{};
+		uav_desc.Format = DXGI_FORMAT_UNKNOWN;
+		uav_desc.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+		uav_desc.Buffer.Flags = 0;
+		uav_desc.Buffer.FirstElement = 0;
+		uav_desc.Buffer.NumElements = count;
+		winrt::com_ptr<ID3D11UnorderedAccessView> uav;
+		DX::ThrowIfFailed(device->CreateUnorderedAccessView(resource.get(), &uav_desc, uav.put()));
+		detail::SetD3DName(uav.get(), name_, " UAV");
+		uavs.push_back(uav);
+	}
+
+	/**
+	 * @brief Maps and uploads data to the structured buffer via write-discard.
+	 * @param src_data Pointer to source data.
+	 * @param data_size Unused; the full buffer ByteWidth is always copied.
+	 */
+	void Update(void const* src_data, [[maybe_unused]] size_t data_size)
+	{
+		auto ctx = globals::d3d::context;
+		D3D11_MAPPED_SUBRESOURCE mapped_buffer{};
+		ZeroMemory(&mapped_buffer, sizeof(D3D11_MAPPED_SUBRESOURCE));
+		DX::ThrowIfFailed(ctx->Map(resource.get(), 0u, D3D11_MAP_WRITE_DISCARD, 0u, &mapped_buffer));
+		memcpy(mapped_buffer.pData, src_data, desc.ByteWidth);
+		ctx->Unmap(resource.get(), 0);
+	}
+
+	/** @brief Uploads an array of elements to the structured buffer. */
+	template <typename T>
+	void UpdateList(T const& src_data, std::int64_t count)
+	{
+		Update(&src_data, sizeof(T) * count);
+	}
+	std::vector<winrt::com_ptr<ID3D11ShaderResourceView>> srvs;
+	std::vector<winrt::com_ptr<ID3D11UnorderedAccessView>> uavs;
+
+private:
+	winrt::com_ptr<ID3D11Buffer> resource;
+	D3D11_BUFFER_DESC desc;
+	UINT count;
+	std::string name_;
+};
+
+/** @brief RAII wrapper around a generic D3D11 buffer with SRV and UAV support. */
+class Buffer
+{
+public:
+	explicit Buffer(D3D11_BUFFER_DESC const& a_desc, D3D11_SUBRESOURCE_DATA* a_init = nullptr, const char* name = nullptr) :
+		desc(a_desc)
+	{
+		auto device = globals::d3d::device;
+		DX::ThrowIfFailed(device->CreateBuffer(&desc, a_init, resource.put()));
+		if (name) {
+			name_ = name;
+			detail::SetD3DName(resource.get(), name_);
+		}
+	}
+
+	/** @brief Creates a shader resource view from the given descriptor. */
+	void CreateSRV(D3D11_SHADER_RESOURCE_VIEW_DESC const& a_desc)
+	{
+		auto device = globals::d3d::device;
+		DX::ThrowIfFailed(device->CreateShaderResourceView(resource.get(), &a_desc, srv.put()));
+		detail::SetD3DName(srv.get(), name_, " SRV");
+	}
+
+	/** @brief Creates an unordered access view from the given descriptor. */
+	void CreateUAV(D3D11_UNORDERED_ACCESS_VIEW_DESC const& a_desc)
+	{
+		auto device = globals::d3d::device;
+		DX::ThrowIfFailed(device->CreateUnorderedAccessView(resource.get(), &a_desc, uav.put()));
+		detail::SetD3DName(uav.get(), name_, " UAV");
+	}
+
+	D3D11_BUFFER_DESC desc;
+	winrt::com_ptr<ID3D11Buffer> resource;
+	winrt::com_ptr<ID3D11ShaderResourceView> srv;
+	winrt::com_ptr<ID3D11UnorderedAccessView> uav;
+
+private:
+	std::string name_;
+};
+
+/** @brief RAII wrapper around a D3D11 1D texture with SRV, UAV, and RTV support. */
+class Texture1D
+{
+public:
+	explicit Texture1D(D3D11_TEXTURE1D_DESC const& a_desc, const char* name = nullptr) :
+		desc(a_desc)
+	{
+		auto device = globals::d3d::device;
+		DX::ThrowIfFailed(device->CreateTexture1D(&desc, nullptr, resource.put()));
+		if (name) {
+			name_ = name;
+			detail::SetD3DName(resource.get(), name_);
+		}
+	}
+
+	/** @brief Creates a shader resource view from the given descriptor. */
+	void CreateSRV(D3D11_SHADER_RESOURCE_VIEW_DESC const& a_desc)
+	{
+		auto device = globals::d3d::device;
+		DX::ThrowIfFailed(device->CreateShaderResourceView(resource.get(), &a_desc, srv.put()));
+		detail::SetD3DName(srv.get(), name_, " SRV");
+	}
+
+	/** @brief Creates an unordered access view from the given descriptor. */
+	void CreateUAV(D3D11_UNORDERED_ACCESS_VIEW_DESC const& a_desc)
+	{
+		auto device = globals::d3d::device;
+		DX::ThrowIfFailed(device->CreateUnorderedAccessView(resource.get(), &a_desc, uav.put()));
+		detail::SetD3DName(uav.get(), name_, " UAV");
+	}
+
+	/** @brief Creates a render target view from the given descriptor. */
+	void CreateRTV(D3D11_RENDER_TARGET_VIEW_DESC const& a_desc)
+	{
+		auto device = globals::d3d::device;
+		DX::ThrowIfFailed(device->CreateRenderTargetView(resource.get(), &a_desc, rtv.put()));
+		detail::SetD3DName(rtv.get(), name_, " RTV");
+	}
+
+	D3D11_TEXTURE1D_DESC desc;
+	winrt::com_ptr<ID3D11Texture1D> resource;
+	winrt::com_ptr<ID3D11ShaderResourceView> srv;
+	winrt::com_ptr<ID3D11UnorderedAccessView> uav;
+	winrt::com_ptr<ID3D11RenderTargetView> rtv;
+
+private:
+	std::string name_;
+};
+
+/** @brief RAII wrapper around a D3D11 2D texture with SRV, UAV, RTV, and DSV support. */
+class Texture2D
+{
+public:
+	explicit Texture2D(D3D11_TEXTURE2D_DESC const& a_desc, const char* name = nullptr) :
+		desc(a_desc)
+	{
+		auto device = globals::d3d::device;
+		DX::ThrowIfFailed(device->CreateTexture2D(&desc, nullptr, resource.put()));
+		if (name) {
+			name_ = name;
+			detail::SetD3DName(resource.get(), name_);
+		}
+	}
+
+	explicit Texture2D(ID3D11Texture2D* a_resource, const char* name = nullptr)
+	{
+		a_resource->GetDesc(&desc);
+		resource.attach(a_resource);
+		if (name) {
+			name_ = name;
+			detail::SetD3DName(resource.get(), name_);
+		}
+	}
+
+	/** @brief Creates a shader resource view from the given descriptor. */
+	void CreateSRV(D3D11_SHADER_RESOURCE_VIEW_DESC const& a_desc)
+	{
+		auto device = globals::d3d::device;
+		DX::ThrowIfFailed(device->CreateShaderResourceView(resource.get(), &a_desc, srv.put()));
+		detail::SetD3DName(srv.get(), name_, " SRV");
+	}
+
+	/** @brief Creates an unordered access view from the given descriptor. */
+	void CreateUAV(D3D11_UNORDERED_ACCESS_VIEW_DESC const& a_desc)
+	{
+		auto device = globals::d3d::device;
+		DX::ThrowIfFailed(device->CreateUnorderedAccessView(resource.get(), &a_desc, uav.put()));
+		detail::SetD3DName(uav.get(), name_, " UAV");
+	}
+
+	/** @brief Creates a render target view from the given descriptor. */
+	void CreateRTV(D3D11_RENDER_TARGET_VIEW_DESC const& a_desc)
+	{
+		auto device = globals::d3d::device;
+		DX::ThrowIfFailed(device->CreateRenderTargetView(resource.get(), &a_desc, rtv.put()));
+		detail::SetD3DName(rtv.get(), name_, " RTV");
+	}
+
+	/** @brief Creates a depth-stencil view from the given descriptor. */
+	void CreateDSV(D3D11_DEPTH_STENCIL_VIEW_DESC const& a_desc)
+	{
+		auto device = globals::d3d::device;
+		DX::ThrowIfFailed(device->CreateDepthStencilView(resource.get(), &a_desc, dsv.put()));
+		detail::SetD3DName(dsv.get(), name_, " DSV");
+	}
+
+	D3D11_TEXTURE2D_DESC desc;
+	winrt::com_ptr<ID3D11Texture2D> resource;
+	winrt::com_ptr<ID3D11ShaderResourceView> srv;
+	winrt::com_ptr<ID3D11UnorderedAccessView> uav;
+	winrt::com_ptr<ID3D11RenderTargetView> rtv;
+	winrt::com_ptr<ID3D11DepthStencilView> dsv;
+
+private:
+	std::string name_;
+};
+
+/** @brief RAII wrapper around a D3D11 3D texture with SRV, UAV, and RTV support. */
+class Texture3D
+{
+public:
+	explicit Texture3D(D3D11_TEXTURE3D_DESC const& a_desc, const char* name = nullptr) :
+		desc(a_desc)
+	{
+		auto device = globals::d3d::device;
+		DX::ThrowIfFailed(device->CreateTexture3D(&desc, nullptr, resource.put()));
+		if (name) {
+			name_ = name;
+			detail::SetD3DName(resource.get(), name_);
+		}
+	}
+
+	explicit Texture3D(ID3D11Texture3D* a_resource, const char* name = nullptr)
+	{
+		a_resource->GetDesc(&desc);
+		resource.attach(a_resource);
+		if (name) {
+			name_ = name;
+			detail::SetD3DName(resource.get(), name_);
+		}
+	}
+
+	/** @brief Creates a shader resource view from the given descriptor. */
+	void CreateSRV(D3D11_SHADER_RESOURCE_VIEW_DESC const& a_desc)
+	{
+		auto device = globals::d3d::device;
+		DX::ThrowIfFailed(device->CreateShaderResourceView(resource.get(), &a_desc, srv.put()));
+		detail::SetD3DName(srv.get(), name_, " SRV");
+	}
+
+	/** @brief Creates an unordered access view from the given descriptor. */
+	void CreateUAV(D3D11_UNORDERED_ACCESS_VIEW_DESC const& a_desc)
+	{
+		auto device = globals::d3d::device;
+		DX::ThrowIfFailed(device->CreateUnorderedAccessView(resource.get(), &a_desc, uav.put()));
+		detail::SetD3DName(uav.get(), name_, " UAV");
+	}
+
+	/** @brief Creates a render target view from the given descriptor. */
+	void CreateRTV(D3D11_RENDER_TARGET_VIEW_DESC const& a_desc)
+	{
+		auto device = globals::d3d::device;
+		DX::ThrowIfFailed(device->CreateRenderTargetView(resource.get(), &a_desc, rtv.put()));
+		detail::SetD3DName(rtv.get(), name_, " RTV");
+	}
+
+	D3D11_TEXTURE3D_DESC desc;
+	winrt::com_ptr<ID3D11Texture3D> resource;
+	winrt::com_ptr<ID3D11ShaderResourceView> srv;
+	winrt::com_ptr<ID3D11UnorderedAccessView> uav;
+	winrt::com_ptr<ID3D11RenderTargetView> rtv;
+
+private:
+	std::string name_;
+};

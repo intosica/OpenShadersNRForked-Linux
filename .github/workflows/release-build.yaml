@@ -1,0 +1,154 @@
+name: "Release: Build Artifacts"
+
+on:
+    push:
+        tags:
+            - "v*"
+    release:
+        # 'published' covers semantic-release's draft → human publish path
+        # (drafts do not fire the 'created' event in practice). 'created'
+        # remains for non-draft releases authored directly via the UI/API.
+        types: [created, published]
+    workflow_dispatch:
+        inputs:
+            cache-key-suffix:
+                description: "Optional suffix to invalidate the build cache"
+                required: false
+            build-cpp:
+                description: "Build C++ plugin and addons for manual dispatch"
+                type: boolean
+                required: false
+                default: true
+            validate-shaders:
+                description: "Run HLSL shader validation for manual dispatch"
+                type: boolean
+                required: false
+                default: true
+
+permissions:
+    contents: read
+
+concurrency:
+    group: ${{ github.workflow }}-${{ github.ref }}
+    cancel-in-progress: true
+
+jobs:
+    # Fallback for anything outside release-semantic.yaml's chained build
+    # (manual draft, workflow_dispatch, direct tag push, or a failed chain):
+    # skip rebuilding when the AIO archive is already attached.
+    check-existing:
+        name: Check for already-attached artifacts
+        if: github.event_name == 'release'
+        runs-on: ubuntu-latest
+        outputs:
+            needs-build: ${{ steps.check.outputs.needs-build }}
+        steps:
+            - name: Check release assets
+              id: check
+              env:
+                  GH_TOKEN: ${{ github.token }}
+                  GH_REPO: ${{ github.repository }}
+                  RELEASE_TAG: ${{ github.event.release.tag_name }}
+              run: |
+                  set -euo pipefail
+                  if gh release view "$RELEASE_TAG" --json assets -q '.assets[].name' 2>/dev/null | grep -q '^CommunityShaders_AIO-.*\.7z$'; then
+                    echo "AIO archive already attached to $RELEASE_TAG -- skipping rebuild."
+                    echo "needs-build=false" >> "$GITHUB_OUTPUT"
+                  else
+                    echo "No AIO archive on $RELEASE_TAG yet -- building."
+                    echo "needs-build=true" >> "$GITHUB_OUTPUT"
+                  fi
+
+    build:
+        name: Build
+        needs: [check-existing]
+        if: always() && !cancelled() && (github.event_name != 'release' || needs.check-existing.outputs.needs-build == 'true')
+        uses: ./.github/workflows/_shared-build.yaml
+        with:
+            ref: ${{ github.ref }}
+            repository: ${{ github.repository }}
+            run-cpp: ${{ github.event_name != 'workflow_dispatch' || inputs.build-cpp == true }}
+            run-shader-validation: ${{ github.event_name != 'workflow_dispatch' || inputs.validate-shaders == true }}
+            run-shader-tests: ${{ github.event_name != 'workflow_dispatch' || inputs.validate-shaders == true }}
+            cache-key-suffix: ${{ inputs.cache-key-suffix || '' }}
+            cache-artifacts: true
+            # Cache build only needs the release-parity (profile) pass.
+            run-full-config-validation: false
+
+    release:
+        name: Post Release for Draft, Manual Run, or Tag
+        needs: [check-existing, build]
+        # cpp-built alone, not needs.build.result: a shader-validation leg
+        # failing must not block attaching what DID build.
+        if: >
+            always() && !cancelled() &&
+            needs.build.outputs.cpp-built == 'true' &&
+            (github.event_name == 'workflow_dispatch' ||
+             startsWith(github.ref, 'refs/tags/v') ||
+             (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')))
+        runs-on: ubuntu-latest
+        outputs:
+            release_tag: ${{ steps.resolve-tag.outputs.release_tag }}
+        steps:
+            - name: Ensure ref is a tag
+              if: github.event_name == 'workflow_dispatch' || github.event_name == 'push'
+              shell: bash
+              run: |
+                  if [ "${{ github.ref_type }}" != "tag" ]; then
+                    echo "This workflow must be run on a tag, not a branch."
+                    exit 1
+                  fi
+
+            - name: Resolve release tag
+              id: resolve-tag
+              shell: bash
+              env:
+                  EVENT_NAME: ${{ github.event_name }}
+                  RELEASE_TAG: ${{ github.event.release.tag_name }}
+                  REF_NAME: ${{ github.ref_name }}
+              run: |
+                  set -euo pipefail
+                  if [ "$EVENT_NAME" = "release" ]; then
+                    echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+                  else
+                    echo "release_tag=$REF_NAME" >> "$GITHUB_OUTPUT"
+                  fi
+
+    attach:
+        name: Attach artifacts to release
+        needs: [release]
+        if: always() && !cancelled() && needs.release.result == 'success'
+        permissions:
+            contents: write
+            id-token: write
+            attestations: write
+        uses: ./.github/workflows/_attach-release-artifacts.yaml
+        with:
+            tag: ${{ needs.release.outputs.release_tag }}
+            draft: "true"
+        secrets:
+            token: ${{ secrets.GITHUB_TOKEN }}
+
+    nexus-upload:
+        # Stable tags only. Proceeds whether THIS run attached artifacts or
+        # check-existing found them already attached by the chained build.
+        name: Nexus Upload
+        needs: [check-existing, attach]
+        if: >
+            always() && !cancelled() &&
+            github.event_name == 'release' &&
+            github.event.action == 'published' &&
+            !contains(github.event.release.tag_name, '-') &&
+            (needs.attach.result == 'success' ||
+             (needs.check-existing.result == 'success' && needs.check-existing.outputs.needs-build == 'false'))
+        uses: ./.github/workflows/nexus-upload.yaml
+        with:
+            tag: ${{ github.event.release.tag_name }}
+            # aio mode (the default) ships CommunityShaders_AIO-*.7z to the fork
+            # page (180419); leave artifact_pattern unset so it uses that default
+            # rather than the CORE archive. Real upload (dry_run=false): the
+            # reusable workflow skips a version already on Nexus, so re-runs are safe.
+            dry_run: "false"
+        # Nested reusable workflows don't auto-inherit repo secrets; inherit
+        # passes the UNEX_* set (cookie + API key) without enumerating each.
+        secrets: inherit

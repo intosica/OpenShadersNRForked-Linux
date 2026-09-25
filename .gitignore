@@ -1,0 +1,33 @@
+build/
+bin/
+dist/
+.idea/
+.vs*/
+CMakeUserPresets.json
+shadertoolsconfig.json
+.vscode
+
+# Folder view configuration files
+**/.DS_Store
+.claude/settings.local.json
+
+tools/__pycache__/
+
+# Semantic Release's plugin dependencies (CI installs these into the
+# checkout via cycjimmy/semantic-release-action); also produced by a local
+# `npm install` for testing .releaserc.js/tools/release-first-parent-plugin.js.
+/node_modules/
+/package.json
+/package-lock.json
+
+# feature_version_audit.py --apply-bumps output, read by
+# tools/release-notes-feature-audit-plugin.js during Semantic Release
+/feature-audit-notes.md
+
+# clangd compile database (machine-specific absolute paths; regenerate with
+# tools/gen-clangd-db.ps1)
+/compile_commands.json
+.github/scripts/__pycache__/
+
+# Proprietary DLSS Neural Rendering runtime; install locally, never distribute.
+**/nvngx_dlssnr.dll

@@ -1,0 +1,36 @@
+--- a/src/Features/Upscaling/NeuralRendering/D3D12Interop.cpp
++++ b/src/Features/Upscaling/NeuralRendering/D3D12Interop.cpp
+@@ -93,7 +93,7 @@
+ 		initialized_ = true;
+ 		lastError_ = S_OK;
+ 		lastOperation_ = "Initialize";
+-		logger::info("[DLSSNR] D3D12 interop initialized commandContexts={} cpuFenceWait=backpressure-only device={}",
++		logger::info("[DLSSNR] D3D12 interop initialized commandContexts={} cpuFenceWait=bounded-per-frame(250ms) device={}",
+ 			kCommandContextCount, ownsDevice_ ? "own" : "shared-with-sidecar");
+ 		return true;
+ 	}
+@@ -225,10 +225,20 @@
+ 		if (FAILED(result)) return RecordFailure(result);
+ 		commandContext.fenceValue = completeValue;
+ 
+-		// This queues a GPU-side dependency. Subsequent D3D11 output copies wait
+-		// for Feature 18 without stalling the render thread on the CPU.
+-		result = context11_->Wait(fence11_.Get(), completeValue);
+-		if (FAILED(result)) return RecordFailure(result);
++		// NOTE(perf-vs-proton): this used to be an unbounded GPU-side wait
++		// (context11_->Wait(fence11_, completeValue)) so the render thread never
++		// stalled on the CPU. On native Windows that's a real hardware/kernel fence
++		// hand-off and it's fine. Under Proton, D3D11 (DXVK) and D3D12 (VKD3D-Proton)
++		// are two separate translation stacks emulating that shared-fence signal
++		// through Vulkan external semaphores; when the signal doesn't propagate
++		// cleanly the D3D11 queue waits on a semaphore that never fires, which is a
++		// genuine stalled GPU queue - a hard freeze, not a stutter, and nothing times
++		// it out. Waiting on the CPU here instead re-introduces the small per-frame
++		// stall the backpressure-only design was trying to avoid, but WaitForFence()
++		// has a 250ms timeout: a stuck fence now fails this call (and disables the
++		// feature via LatchFailure upstream) instead of hanging the GPU forever.
++		if (!WaitForFence(completeValue))
++			return false;
+ 		lastError_ = S_OK;
+ 		return true;
+ 	}

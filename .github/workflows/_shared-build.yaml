@@ -1,0 +1,484 @@
+name: "(Shared) Build and Validate"
+
+on:
+    workflow_call:
+        inputs:
+            ref:
+                description: "Git ref to check out"
+                type: string
+                required: true
+            repository:
+                description: "Repository to check out (owner/repo)"
+                type: string
+                required: true
+            run-cpp:
+                description: "Run C++ plugin build"
+                type: boolean
+                default: true
+            run-shader-validation:
+                description: "Run HLSL shader compilation validation"
+                type: boolean
+                default: true
+            run-shader-tests:
+                description: "Run shader unit tests"
+                type: boolean
+                default: true
+            cache-artifacts:
+                description: "Compile shader validation at release parity and upload distributable ShaderCache artifacts"
+                type: boolean
+                default: false
+            release-parity-validation:
+                description: "Run the release-parity pass (/O3 + default-install profile config) WITHOUT producing cache artifacts. Implied by cache-artifacts; use to gate a release, or alongside run-full-config-validation on PRs to cover both sets."
+                type: boolean
+                default: false
+            upload-compiled-shaders:
+                description: "Upload the release-parity pass's raw compiled binaries (pre-finalize, no Info.ini) for a later reuse-compiled-shaders call to download. Compile output only depends on shader source, not the checked-out ref's version, so this is safe to produce on a pre-version-bump ref."
+                type: boolean
+                default: false
+            reuse-compiled-shaders:
+                description: "Skip the release-parity fxc compile and download a prior upload-compiled-shaders run's binaries instead. Finalize/upload still run normally against THIS ref's CMakeLists.txt/feature .ini, so Info.ini's PluginVersion and feature Versions stay correct even though the compile itself was reused."
+                type: boolean
+                default: false
+            run-full-config-validation:
+                description: "Run the full-config pass (every feature, default opt). On by default for broad PR coverage; release/cache/gate runs set this false since they only need the release-parity (profile) set."
+                type: boolean
+                default: true
+            run-cpp-tests:
+                description: "Run C++ unit tests (tests/cpp)"
+                type: boolean
+                default: true
+            hlsl-should-build:
+                description: "Passed to check-hlsl-changes; 'true' forces shader steps to run"
+                type: string
+                default: "true"
+            shader-tests-should-build:
+                description: "Passed to check-hlsl-changes for unit tests"
+                type: string
+                default: "true"
+            cpp-tests-should-build:
+                description: "Forces cpp_tests build+run when 'true'; lets PR-checks skip it otherwise"
+                type: string
+                default: "true"
+            cache-key-suffix:
+                description: "Optional suffix to invalidate the build cache"
+                type: string
+                default: ""
+            changed-files-json:
+                description: "JSON array of changed paths for incremental shader validation; empty => full validation"
+                type: string
+                default: ""
+            cmake-preset:
+                description: "CMake configure/build preset for the C++ build (ALL = full LTCG shipping flags; PR = mild optimization without LTCG or full debug info)"
+                type: string
+                default: "ALL"
+        outputs:
+            version:
+                description: "CMake project version extracted from the build"
+                value: ${{ jobs.cpp-build.outputs.version }}
+            cpp-built:
+                description: "'true' if the C++ build job ran and succeeded"
+                value: ${{ jobs.cpp-build.result == 'success' }}
+
+jobs:
+    cpp-build:
+        name: Build plugin and addons (${{ matrix.compiler.name }})
+        if: inputs.run-cpp
+        runs-on: windows-2025-vs2026
+        permissions:
+            contents: read
+        outputs:
+            version: ${{ steps.get_version.outputs.version }}
+        strategy:
+            matrix:
+                compiler:
+                    - name: vs2026
+                      cmake-preset: ${{ inputs.cmake-preset }}
+                      build-dir: build/${{ inputs.cmake-preset }}
+            fail-fast: false
+        steps:
+            - name: Checkout code
+              uses: actions/checkout@v6
+              with:
+                  ref: ${{ inputs.ref }}
+                  repository: ${{ inputs.repository }}
+                  submodules: recursive
+                  persist-credentials: false
+                  allow-unsafe-pr-checkout: ${{ github.event_name == 'pull_request_target' }}
+
+            - name: Setup Build Environment
+              id: setup
+              uses: ./.github/actions/setup-build-environment
+              with:
+                  cache-key-suffix: "cpp-${{ matrix.compiler.name }}${{ inputs.cache-key-suffix }}"
+                  cmake-preset: ${{ matrix.compiler.cmake-preset }}
+                  build-dir: ${{ matrix.compiler.build-dir }}
+
+            - name: Build using run-cmake
+              uses: lukka/run-cmake@v10
+              with:
+                  configurePreset: ${{ matrix.compiler.cmake-preset }}
+                  configurePresetAdditionalArgs: "['-DBUILD_SHADER_TESTS=OFF']"
+                  buildPreset: ${{ matrix.compiler.cmake-preset }}
+
+            - name: Extract version from CMake
+              id: get_version
+              shell: pwsh
+              run: |
+                  $content = Get-Content ${{ matrix.compiler.build-dir }}/CMakeCache.txt
+                  $versionLine = $content | Select-String -Pattern 'CMAKE_PROJECT_VERSION:STATIC'
+                  if ($versionLine) {
+                      $version = ($versionLine -replace '.*=([0-9]+\.[0-9]+\.[0-9]+).*', '$1').ToString()
+                  } else {
+                      Write-Error "Version extraction failed: CMAKE_PROJECT_VERSION not found in CMakeCache.txt" -ErrorAction Stop
+                  }
+                  if (-not $version -or $version -eq "") {
+                      Write-Error "Version extraction failed: no version found" -ErrorAction Stop
+                  }
+                  "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+            - name: Fail if CMake version does not match tag
+              if: success() && github.ref_type == 'tag'
+              shell: pwsh
+              run: |
+                  $tag = '${{ github.ref_name }}'
+                  $expected = ($tag -replace '^v([0-9]+\.[0-9]+\.[0-9]+).*', '$1')
+                  $version = '${{ steps.get_version.outputs.version }}'
+                  if (-not $version -or $version -eq "") {
+                    Write-Error "Version extraction failed: no version found in previous step" -ErrorAction Stop
+                  }
+                  if ($version -ne $expected) {
+                    Write-Error "CMakeLists.txt version '$version' does not match tag version '$expected'. Please update CMakeLists.txt before tagging." -ErrorAction Stop
+                  } else {
+                    Write-Host "CMakeLists.txt version matches tag."
+                  }
+
+            - name: Upload dist artifacts
+              if: success() && matrix.compiler.name == 'vs2026'
+              uses: actions/upload-artifact@v7
+              with:
+                  name: dist-artifacts
+                  path: dist/
+                  retention-days: 30
+
+    shader-validation:
+        # Full-config and release-parity are independent fxc invocations against
+        # the same prepared shader tree (~30-40 min each on a PR) -- splitting
+        # them into their own matrix legs instead of running sequentially in one
+        # job roughly halves shader-validation wall-clock. `matrix` isn't
+        # available in a job-level `if` (evaluated before matrix expansion), so
+        # each pass's original run condition (full-config runs when
+        # run-full-config-validation is set; release-parity runs for cache
+        # builds or release-parity-validation) gates the compile step instead --
+        # a leg that doesn't need its pass still runs checkout/setup (cheap) and
+        # just skips the actual fxc invocation.
+        if: inputs.run-shader-validation
+        name: Validate shader compilation (${{ matrix.config.name }} / ${{ matrix.pass }})
+        runs-on: windows-2025-vs2026
+        permissions:
+            contents: read
+        strategy:
+            matrix:
+                config:
+                    - name: "Flatrim"
+                      file: ".github/configs/shader-validation.yaml"
+                      runtime: "SE"
+                    - name: "VR"
+                      file: ".github/configs/shader-validation-vr.yaml"
+                      runtime: "VR"
+                pass: [full-config, release-parity]
+            fail-fast: false
+        steps:
+            - name: Checkout code
+              uses: actions/checkout@v6
+              with:
+                  ref: ${{ inputs.ref }}
+                  repository: ${{ inputs.repository }}
+                  submodules: recursive
+                  persist-credentials: false
+                  allow-unsafe-pr-checkout: ${{ github.event_name == 'pull_request_target' }}
+
+            - name: Check for HLSL Changes
+              id: check-hlsl
+              uses: ./.github/actions/check-hlsl-changes
+              with:
+                  hlsl-should-build: ${{ inputs.hlsl-should-build }}
+            - name: Setup Build Environment
+              id: setup
+              if: steps.check-hlsl.outputs.skip != 'true'
+              uses: ./.github/actions/setup-build-environment
+              with:
+                  cache-key-suffix: "validation${{ inputs.cache-key-suffix }}"
+            - name: Prepare shaders
+              if: steps.check-hlsl.outputs.skip != 'true'
+              uses: ./.github/actions/prepare-shaders
+            - name: Locate fxc.exe
+              if: steps.check-hlsl.outputs.skip != 'true'
+              id: find_fxc
+              shell: pwsh
+              run: |
+                  $fxcCmd = Get-Command -Name fxc.exe -ErrorAction SilentlyContinue
+                  if ($fxcCmd) {
+                    $fxcPath = $fxcCmd.Source
+                    Write-Host "Found fxc.exe at $fxcPath"
+                    Add-Content -Path $env:GITHUB_OUTPUT -Value "fxc_path=$fxcPath"
+                  } else {
+                    $fxcPath = ''
+                    $sdkRoot = 'C:\Program Files (x86)\Windows Kits\10\bin'
+                    if (Test-Path $sdkRoot) {
+                      $versions = Get-ChildItem -Path $sdkRoot -Directory | Sort-Object -Descending
+                      foreach ($v in $versions) {
+                        $candidate = Join-Path $v.FullName 'x64\fxc.exe'
+                        if (Test-Path $candidate) { $fxcPath = $candidate; break }
+                      }
+                    }
+                    if ($fxcPath -ne '') {
+                      Write-Host "Found fxc.exe at $fxcPath"
+                      Add-Content -Path $env:GITHUB_OUTPUT -Value "fxc_path=$fxcPath"
+                    } else {
+                      Write-Warning "fxc.exe not found in PATH or common SDK locations"
+                      Add-Content -Path $env:GITHUB_OUTPUT -Value "fxc_path="
+                    }
+                  }
+
+            # --shader-dir stays on build/ALL: prepare-shaders always populates
+            # the ALL preset; inputs.cmake-preset only selects the C++ tier.
+            # validate_changed_shaders builds the #include graph and compiles
+            # only entry points that transitively include a changed file, so
+            # both passes stay bounded by the change set:
+            #   full-config: default opt -- every feature path stays covered.
+            #   release-parity: /O3 (debug defines stripped) on the
+            #     default-install profile config (non-AIO and
+            #     default-disabled defines stripped -- the shipped cache
+            #     targets a default install). This is the set the release
+            #     ships and the only one that surfaces /O3-only warnings
+            #     (e.g. X4000 uninitialized return).
+            - name: Download pre-compiled shader binaries (${{ matrix.config.runtime }})
+              if: matrix.pass == 'release-parity' && inputs.reuse-compiled-shaders && steps.check-hlsl.outputs.skip != 'true'
+              uses: actions/download-artifact@v7
+              with:
+                  name: CompiledShaderBinaries-${{ matrix.config.runtime }}
+                  path: build/ShaderCache
+
+            - name: Validate shader compilation (${{ matrix.config.name }} / ${{ matrix.pass }})
+              if: >
+                  steps.check-hlsl.outputs.skip != 'true' &&
+                  ((matrix.pass == 'full-config' && inputs.run-full-config-validation) ||
+                   (matrix.pass == 'release-parity' && (inputs.cache-artifacts || inputs.release-parity-validation) && !inputs.reuse-compiled-shaders))
+              shell: bash
+              env:
+                  CHANGED_FILES_JSON: ${{ inputs.changed-files-json }}
+              run: |
+                  if [ -z "${{ steps.find_fxc.outputs.fxc_path }}" ]; then
+                    echo "fxc.exe not found - shader validation requires fxc.exe. Set --fxc to a valid path or ensure fxc.exe is in PATH." >&2
+                    exit 1
+                  fi
+                  # Materialize the changed-file list (one path per line). An empty
+                  # or absent JSON yields an empty file, which the wrapper treats
+                  # as "unknown change set" and validates everything (push/release).
+                  # If the JSON is malformed/truncated, fall back to an empty file
+                  # (=> full validation) rather than aborting the job.
+                  : > changed_files.txt
+                  if [ -n "$CHANGED_FILES_JSON" ]; then
+                    if ! printf '%s' "$CHANGED_FILES_JSON" | jq -r '.[]' > changed_files.txt 2>/dev/null; then
+                      echo "WARNING: could not parse changed-files JSON; running FULL validation."
+                      : > changed_files.txt
+                    fi
+                  fi
+                  echo "Changed files for incremental validation:"
+                  cat changed_files.txt || true
+                  FXC="${{ steps.find_fxc.outputs.fxc_path }}"
+                  PLAIN_CONFIG="${{ matrix.config.file }}"
+
+                  if [ "${{ matrix.pass }}" = "full-config" ]; then
+                    mkdir -p build/ShaderCacheFull
+                    echo "::group::Full-config validation (default opt)"
+                    python tools/validate_changed_shaders.py --changed-list-file changed_files.txt -- \
+                      hlslkit-compile --fxc "$FXC" --shader-dir build/ALL/aio/Shaders --output-dir build/ShaderCacheFull --config "$PLAIN_CONFIG" --max-warnings 0 --suppress-warnings X1519
+                    echo "::endgroup::"
+                  else
+                    mkdir -p build/ShaderCache
+                    echo "::group::Release-parity validation (/O3, default-install profile)"
+                    PROFILE_CONFIG="profile-config-${{ matrix.config.runtime }}.yaml"
+                    python tools/build-shader-cache.py --emit-profile-config "$PLAIN_CONFIG" "$PROFILE_CONFIG"
+                    python tools/validate_changed_shaders.py --changed-list-file changed_files.txt -- \
+                      hlslkit-compile --fxc "$FXC" --shader-dir build/ALL/aio/Shaders --output-dir build/ShaderCache --config "$PROFILE_CONFIG" --max-warnings 0 --suppress-warnings X1519 --strip-debug-defines --optimization-level 3 --timing-report "build/shader-compile-timing-${{ matrix.config.runtime }}.json"
+                    echo "::endgroup::"
+                  fi
+
+            - name: Upload compiled shader binaries (${{ matrix.config.runtime }})
+              if: matrix.pass == 'release-parity' && inputs.upload-compiled-shaders && steps.check-hlsl.outputs.skip != 'true'
+              uses: actions/upload-artifact@v7
+              with:
+                  name: CompiledShaderBinaries-${{ matrix.config.runtime }}
+                  path: build/ShaderCache
+                  retention-days: 1
+                  if-no-files-found: error
+
+            # Never runs in pull_request_target contexts or on fork checkouts
+            # (cache-artifacts is only set by release-build); the guards make
+            # that structural for CodeQL and future callers. release-parity
+            # only: ShaderCache/ is that pass's output dir.
+            - name: Finalize distributable shader cache (${{ matrix.config.runtime }})
+              if: matrix.pass == 'release-parity' && inputs.cache-artifacts && github.event_name != 'pull_request_target' && inputs.repository == github.repository && steps.check-hlsl.outputs.skip != 'true'
+              shell: bash
+              run: |
+                  # Re-profiles default-disabled features' shaders (validation keeps their
+                  # defines on for coverage), prunes sidecars, writes Info.ini.
+                  python tools/build-shader-cache.py --finalize-existing build/ShaderCache --shader-dir build/ALL/aio/Shaders --runtime ${{ matrix.config.runtime }}
+
+            - name: Upload shader cache artifact (${{ matrix.config.runtime }})
+              if: matrix.pass == 'release-parity' && inputs.cache-artifacts && github.event_name != 'pull_request_target' && inputs.repository == github.repository && steps.check-hlsl.outputs.skip != 'true'
+              uses: actions/upload-artifact@v7
+              with:
+                  name: ShaderCache-${{ matrix.config.runtime }}
+                  path: build/ShaderCache
+                  retention-days: 30
+
+            # Both possible output dirs are listed (if-no-files-found: ignore
+            # covers whichever pass this leg didn't run) so full-config
+            # failures -- previously not captured, since that pass writes to
+            # ShaderCacheFull/ instead of ShaderCache/ -- are now uploaded too.
+            - name: Upload shader validation logs
+              if: failure() && steps.check-hlsl.outputs.skip != 'true'
+              uses: actions/upload-artifact@v7
+              with:
+                  name: shader-validation-logs-${{ matrix.config.name }}-${{ matrix.pass }}
+                  path: |
+                      build/ShaderCache/new_issues.log
+                      build/ShaderCache/*.log
+                      build/ShaderCacheFull/new_issues.log
+                      build/ShaderCacheFull/*.log
+                  retention-days: 7
+                  if-no-files-found: ignore
+
+            # Release-parity only: per-shader fxc /O3 compile durations, sorted
+            # slowest-first (hlslkit --timing-report), for spotting compile-time
+            # hot spots without a manual A/B bisection.
+            - name: Upload shader compile timing report
+              if: always() && matrix.pass == 'release-parity' && steps.check-hlsl.outputs.skip != 'true'
+              uses: actions/upload-artifact@v7
+              with:
+                  name: shader-compile-timing-${{ matrix.config.runtime }}
+                  path: build/shader-compile-timing-${{ matrix.config.runtime }}.json
+                  retention-days: 30
+                  if-no-files-found: ignore
+
+    shader-unit-tests:
+        name: Run Shader Unit Tests
+        if: inputs.run-shader-tests
+        runs-on: windows-2025-vs2026
+        permissions:
+            contents: read
+        steps:
+            - name: Checkout code
+              uses: actions/checkout@v6
+              with:
+                  ref: ${{ inputs.ref }}
+                  repository: ${{ inputs.repository }}
+                  submodules: recursive
+                  # Safe: this job is contents:read and this workflow takes no secrets input.
+                  allow-unsafe-pr-checkout: true
+
+            - name: Check for HLSL Changes
+              id: check-hlsl
+              uses: ./.github/actions/check-hlsl-changes
+              with:
+                  hlsl-should-build: ${{ inputs.shader-tests-should-build }}
+            - name: Setup Build Environment
+              id: setup
+              if: steps.check-hlsl.outputs.skip != 'true'
+              uses: ./.github/actions/setup-build-environment
+              with:
+                  cache-key-suffix: "tests${{ inputs.cache-key-suffix }}"
+                  cmake-preset: "ALL"
+                  build-dir: "build/ALL"
+
+            - name: Build shader tests
+              if: steps.check-hlsl.outputs.skip != 'true'
+              uses: lukka/run-cmake@v10
+              with:
+                  configurePreset: ALL
+                  configurePresetAdditionalArgs: "['-DBUILD_SHADER_TESTS=ON']"
+                  buildPreset: ALL
+                  buildPresetAdditionalArgs: "['--target shader_tests']"
+
+            - name: Run shader unit tests
+              if: steps.check-hlsl.outputs.skip != 'true'
+              run: |
+                  ctest --test-dir build/ALL -C Release --output-on-failure -R ShaderTests --timeout 300
+
+            - name: Upload test results on failure
+              if: failure() && steps.check-hlsl.outputs.skip != 'true'
+              uses: actions/upload-artifact@v7
+              with:
+                  name: shader-test-results
+                  path: |
+                      build/ALL/Testing/**
+                  retention-days: 7
+                  if-no-files-found: ignore
+
+    cpp-unit-tests:
+        name: Run C++ Unit Tests
+        if: inputs.run-cpp-tests
+        runs-on: windows-2025-vs2026
+        permissions:
+            contents: read
+        steps:
+            - name: Checkout code
+              uses: actions/checkout@v6
+              with:
+                  ref: ${{ inputs.ref }}
+                  repository: ${{ inputs.repository }}
+                  submodules: recursive
+                  # Safe: this job is contents:read and this workflow takes no secrets input.
+                  allow-unsafe-pr-checkout: true
+
+            # Inline gate (no composite action - the logic is one branch).
+            # PR events skip when no relevant files changed; push / dispatch /
+            # release always run.
+            - name: Check if cpp_tests should run
+              id: check-cpp
+              shell: bash
+              run: |
+                  if [ "${{ github.event_name }}" != "pull_request_target" ]; then
+                    echo "Non-PR event, proceeding."
+                    echo "skip=false" >> $GITHUB_OUTPUT
+                  elif [ "${{ inputs.cpp-tests-should-build }}" != "true" ]; then
+                    echo "No cpp_tests-related changes detected, skipping."
+                    echo "skip=true" >> $GITHUB_OUTPUT
+                  else
+                    echo "cpp_tests-related changes detected, proceeding."
+                    echo "skip=false" >> $GITHUB_OUTPUT
+                  fi
+
+            - name: Setup Build Environment
+              id: setup
+              if: steps.check-cpp.outputs.skip != 'true'
+              uses: ./.github/actions/setup-build-environment
+              with:
+                  cache-key-suffix: "cpp-tests${{ inputs.cache-key-suffix }}"
+                  cmake-preset: "ALL"
+                  build-dir: "build/ALL"
+
+            - name: Build cpp_tests
+              if: steps.check-cpp.outputs.skip != 'true'
+              uses: lukka/run-cmake@v10
+              with:
+                  configurePreset: ALL
+                  buildPreset: ALL
+                  buildPresetAdditionalArgs: "['--target cpp_tests']"
+
+            - name: Run C++ unit tests
+              if: steps.check-cpp.outputs.skip != 'true'
+              run: |
+                  ctest --test-dir build/ALL -C Release --output-on-failure -R CppUtilTests --timeout 60
+
+            - name: Upload test results on failure
+              if: failure() && steps.check-cpp.outputs.skip != 'true'
+              uses: actions/upload-artifact@v7
+              with:
+                  name: cpp-test-results
+                  path: |
+                      build/ALL/Testing/**
+                  retention-days: 7
+                  if-no-files-found: ignore

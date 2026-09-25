@@ -1,6 +1,3 @@
-[submodule "extern/CommonLibSSE-NG"]
-	path = extern/CommonLibSSE-NG
-	url = https://github.com/CharmedBaryon/CommonLibSSE-NG
 [submodule "extern/Streamline-DX12"]
 	path = extern/Streamline-DX12
 	url = https://github.com/NVIDIA-RTX/Streamline.git
@@ -8,3 +5,6 @@
 	path = extern/FidelityFX-SDK
 	url = https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK
 	branch = optiscaler-build
+[submodule "extern/CommonLibSSE-NG"]
+	path = extern/CommonLibSSE-NG
+	url = https://github.com/CharmedBaryon/CommonLibSSE-NG

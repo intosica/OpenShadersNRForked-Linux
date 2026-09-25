@@ -178,6 +178,7 @@ target_include_directories(
         "${CMAKE_SOURCE_DIR}/extern/stb_image_write_hdr_png"
         ${DETOURS_INCLUDE_DIRS}
         ${EXPRTK_INCLUDE_DIRS}
+        "${CMAKE_SOURCE_DIR}/extern/FidelityFX-SDK/sdk/include"
 )
 
 # ImGuiVRHelper client API — fetched from upstream so the dependency and its

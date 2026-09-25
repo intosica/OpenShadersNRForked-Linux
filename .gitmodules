@@ -3,8 +3,7 @@
 	url = https://github.com/NVIDIA-RTX/Streamline.git
 [submodule "extern/FidelityFX-SDK"]
 	path = extern/FidelityFX-SDK
-	url = https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK
-	branch = optiscaler-build
+	url = https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK.git
 [submodule "extern/CommonLibSSE-NG"]
 	path = extern/CommonLibSSE-NG
 	url = https://github.com/CharmedBaryon/CommonLibSSE-NG

@@ -1,8 +1,10 @@
 #pragma once
 
-#include "PCH.h"
-
+#include <d3d11.h>
+#include <DirectXMath.h>
 #include <atomic>
+
+#include <RE/Skyrim.h>
 
 struct CloudShadows;
 struct CloudRelight;

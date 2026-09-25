@@ -6,11 +6,6 @@
 
 #include <RE/Skyrim.h>
 
-using Matrix = DirectX::XMFLOAT4X4;
-using Vector2 = DirectX::XMFLOAT2;
-using Vector3 = DirectX::XMFLOAT3;
-using Vector4 = DirectX::XMFLOAT4;
-
 struct CloudShadows;
 struct CloudRelight;
 struct DynamicCubemaps;
@@ -101,6 +96,19 @@ void InstallD3DHooks(ID3D11DeviceContext* a_context);
 
 namespace globals
 {
+    // Moved here (from global scope) because CommonLibVR's RE/S/State.h does
+    // `using namespace DirectX::SimpleMath;` at global scope, which also
+    // defines a `Matrix`/`Vector2`/`Vector3`/`Vector4`. Declaring our aliases
+    // inside this namespace instead of at global scope means unqualified
+    // lookups from within `globals` resolve to these first, without ever
+    // reaching the ambiguous global-scope candidates. Other files (VRUtils.h,
+    // ColorSpace.h, ColorGrading.cpp) already mean DirectX::SimpleMath::Matrix
+    // when they use it unqualified, so this doesn't touch them.
+    using Matrix = DirectX::XMFLOAT4X4;
+    using Vector2 = DirectX::XMFLOAT2;
+    using Vector3 = DirectX::XMFLOAT3;
+    using Vector4 = DirectX::XMFLOAT4;
+
     namespace d3d
     {
         extern ID3D11Device* device;

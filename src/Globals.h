@@ -1,15 +1,8 @@
 #pragma once
 
-#include <atomic>
-#include <cstdint>
-#include <d3d11.h>
-#include <dxgi.h>
-#include <DirectXMath.h>
+#include "PCH.h"
 
-#include <REL/Relocation.h>
-#include <REX/EnumSet.h>
-#include <REX/W32/D3D11.h>
-#include <RE/Skyrim.h>
+#include <atomic>
 
 struct CloudShadows;
 struct CloudRelight;

@@ -80,25 +80,20 @@ jobs:
         needs: [check-existing, build]
         # cpp-built alone, not needs.build.result: a shader-validation leg
         # failing must not block attaching what DID build.
+        # Gated on github.ref_type == 'tag' so this job -- and everything
+        # chained off it below (attach, nexus-upload) -- is SKIPPED rather
+        # than failed when this workflow runs against a branch (e.g. a
+        # workflow_dispatch run against main). Release posting only ever
+        # makes sense for a tag; a branch run should just finish green with
+        # the build/test artifacts and nothing to attach.
         if: >
             always() && !cancelled() &&
             needs.build.outputs.cpp-built == 'true' &&
-            (github.event_name == 'workflow_dispatch' ||
-             startsWith(github.ref, 'refs/tags/v') ||
-             (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')))
+            github.ref_type == 'tag'
         runs-on: ubuntu-latest
         outputs:
             release_tag: ${{ steps.resolve-tag.outputs.release_tag }}
         steps:
-            - name: Ensure ref is a tag
-              if: github.event_name == 'workflow_dispatch' || github.event_name == 'push'
-              shell: bash
-              run: |
-                  if [ "${{ github.ref_type }}" != "tag" ]; then
-                    echo "This workflow must be run on a tag, not a branch."
-                    exit 1
-                  fi
-
             - name: Resolve release tag
               id: resolve-tag
               shell: bash
@@ -132,6 +127,12 @@ jobs:
     nexus-upload:
         # Stable tags only. Proceeds whether THIS run attached artifacts or
         # check-existing found them already attached by the chained build.
+        # secrets.UNEX_APIKEY != '' is a belt-and-suspenders guard: this job
+        # is already unreachable on branch/dispatch runs via the
+        # github.event_name == 'release' check below, but on forks (or a repo
+        # where Nexus credentials just haven't been configured yet) a real
+        # published release would otherwise still try to call the reusable
+        # upload workflow with an empty API key. Skip (not fail) instead.
         name: Nexus Upload
         needs: [check-existing, attach]
         if: >
@@ -139,6 +140,7 @@ jobs:
             github.event_name == 'release' &&
             github.event.action == 'published' &&
             !contains(github.event.release.tag_name, '-') &&
+            secrets.UNEX_APIKEY != '' &&
             (needs.attach.result == 'success' ||
              (needs.check-existing.result == 'success' && needs.check-existing.outputs.needs-build == 'false'))
         uses: ./.github/workflows/nexus-upload.yaml

@@ -324,8 +324,8 @@ void FidelityFX::Present(bool a_useFrameGeneration, bool a_isHDR)
 
 		ffx::DispatchDescFrameGenerationPrepareCameraInfo cameraConfig{};
 
-		auto viewMatrix = globals::game::frameBufferCached.GetCameraViewInverse().Transpose();
-		auto cameraViewToClip = globals::game::frameBufferCached.GetCameraProjUnjittered().Transpose();
+		auto viewMatrix = Matrix(globals::game::frameBufferCached.GetCameraViewInverse()).Transpose();
+		auto cameraViewToClip = Matrix(globals::game::frameBufferCached.GetCameraProjUnjittered()).Transpose();
 
 		cameraConfig.cameraRight[0] = viewMatrix._11;
 		cameraConfig.cameraRight[1] = viewMatrix._12;

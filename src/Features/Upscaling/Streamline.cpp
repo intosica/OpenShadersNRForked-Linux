@@ -447,8 +447,8 @@ bool Streamline::CheckFrameConstants(sl::ViewportHandle p_viewport, uint32_t eye
 	slConstants.cameraNear = *globals::game::cameraNear;
 	slConstants.cameraFar = *globals::game::cameraFar;
 
-	auto viewMatrix = globals::game::frameBufferCached.GetCameraViewInverse(eyeIndex).Transpose();
-	auto cameraViewToClip = globals::game::frameBufferCached.GetCameraProjUnjittered(eyeIndex).Transpose();
+	auto viewMatrix = Matrix(globals::game::frameBufferCached.GetCameraViewInverse(eyeIndex)).Transpose();
+	auto cameraViewToClip = Matrix(globals::game::frameBufferCached.GetCameraProjUnjittered(eyeIndex)).Transpose();
 
 	slConstants.cameraMotionIncluded = sl::Boolean::eTrue;
 	slConstants.cameraPinholeOffset = { 0.f, 0.f };
@@ -464,8 +464,8 @@ bool Streamline::CheckFrameConstants(sl::ViewportHandle p_viewport, uint32_t eye
 		// recalculateCameraMatrices() uses a single static prev-frame slot -- unusable for two viewports.
 		sl::matrixFullInvert(slConstants.clipToCameraView, slConstants.cameraViewToClip);
 
-		auto currViewProj = globals::game::frameBufferCached.GetCameraViewProjUnjittered(eyeIndex).Transpose();
-		auto prevViewProj = globals::game::frameBufferCached.GetCameraPreviousViewProjUnjittered(eyeIndex).Transpose();
+		auto currViewProj = Matrix(globals::game::frameBufferCached.GetCameraViewProjUnjittered(eyeIndex)).Transpose();
+		auto prevViewProj = Matrix(globals::game::frameBufferCached.GetCameraPreviousViewProjUnjittered(eyeIndex)).Transpose();
 
 		sl::float4x4 currViewProjSL = *(sl::float4x4*)&currViewProj;
 		sl::float4x4 prevViewProjSL = *(sl::float4x4*)&prevViewProj;

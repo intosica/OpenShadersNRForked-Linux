@@ -2611,7 +2611,7 @@ void Upscaling::FillMenuCameraMotionVectors()
 		// Inversion is convention-safe on the raw cb12 bytes; composition with the previous
 		// view-proj stays in the shader so the mul() convention matches FrameBuffer usage.
 		cbData.curViewProjUnjitteredInverse[eyeIndex] =
-			globals::game::frameBufferCached.GetCameraViewProjUnjittered(eyeIndex).Invert();
+			Matrix(globals::game::frameBufferCached.GetCameraViewProjUnjittered(eyeIndex)).Invert();
 		cbData.prevViewProjUnjittered[eyeIndex] =
 			globals::game::frameBufferCached.GetCameraPreviousViewProjUnjittered(eyeIndex);
 	}

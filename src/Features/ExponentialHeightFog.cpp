@@ -452,7 +452,7 @@ void ExponentialHeightFog::Prepass()
 
 	const uint32_t eyeCount = globals::game::isVR ? 2u : 1u;
 	for (uint32_t eyeIndex = 0; eyeIndex < eyeCount; eyeIndex++) {
-		cb.clipToWorld[eyeIndex] = globals::game::frameBufferCached.GetCameraViewProjUnjittered(eyeIndex).Invert();
+		cb.clipToWorld[eyeIndex] = Matrix(globals::game::frameBufferCached.GetCameraViewProjUnjittered(eyeIndex)).Invert();
 	}
 	if (eyeCount == 1u) {
 		cb.clipToWorld[1] = cb.clipToWorld[0];

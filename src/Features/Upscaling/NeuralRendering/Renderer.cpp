@@ -7,6 +7,7 @@
 #include "Utils/LazyShader.h"
 
 #include <array>
+#include <chrono>
 #include <utility>
 
 #include <d3d11.h>
@@ -70,7 +71,9 @@ namespace NeuralRendering
 			float motionVectorScaleX, float motionVectorScaleY, const Tuning& tuning,
 			std::uint32_t depthSourceWidth, std::uint32_t depthSourceHeight)
 		{
-			if (failureLatched || !device || !context || eyeIndex >= eyes.size() || !color || !depth || !depthSRV || !motionVectors)
+			if (!device || !context || eyeIndex >= eyes.size() || !color || !depth || !depthSRV || !motionVectors)
+				return false;
+			if (!RecoverFromLatchIfDue())
 				return false;
 			CS_GPU_PASS("NeuralRendering::Evaluate");
 
@@ -138,6 +141,7 @@ namespace NeuralRendering
 
 			context->CopyResource(color, eye.output.resource11.Get());
 			resetPending[eyeIndex] = false;
+			consecutiveFailures = 0;
 			return true;
 		}
 
@@ -146,7 +150,9 @@ namespace NeuralRendering
 			std::uint32_t guideWidth, std::uint32_t guideHeight,
 			std::uint32_t colorWidth, std::uint32_t colorHeight, const Tuning& tuning)
 		{
-			if (failureLatched || !device || !context || !color)
+			if (!device || !context || !color)
+				return false;
+			if (!RecoverFromLatchIfDue())
 				return false;
 			CS_GPU_PASS("NeuralRendering::EvaluateStereo");
 
@@ -236,6 +242,7 @@ namespace NeuralRendering
 					eyes[eyeIndex].output.resource11.Get(), 0, &outputBox);
 				resetPending[eyeIndex] = false;
 			}
+			consecutiveFailures = 0;
 			return true;
 		}
 
@@ -247,6 +254,7 @@ namespace NeuralRendering
 			eyes = {};
 			resetPending = { true, true };
 			failureLatched = false;
+			consecutiveFailures = 0;
 			copyDepthGuideCS.Reset();
 			depthGuideCB.reset();
 		}
@@ -391,10 +399,45 @@ namespace NeuralRendering
 		bool LatchFailure(const char* operation, HRESULT error)
 		{
 			failureLatched = true;
-			logger::error("[DLSSNR] {} failed hr/ngx=0x{:08X} status={} detail={}",
-				operation, static_cast<std::uint32_t>(error), ToString(Runtime::Instance().Status()), Runtime::Instance().Detail());
+			failureLatchedAt = std::chrono::steady_clock::now();
+			++consecutiveFailures;
+			logger::error("[DLSSNR] {} failed hr/ngx=0x{:08X} status={} detail={} (consecutive={}, retry in {}ms)",
+				operation, static_cast<std::uint32_t>(error), ToString(Runtime::Instance().Status()), Runtime::Instance().Detail(),
+				consecutiveFailures, consecutiveFailures > kMaxAutoRetries ? -1 : kRetryCooldown.count());
 			return false;
 		}
+
+		// A single failed frame (e.g. the D3D11/D3D12 cross-API fence occasionally
+		// timing out under Proton - see EndD3D12) used to permanently disable NR for
+		// the rest of the play session: failureLatched was only ever cleared by an
+		// unrelated external Reset() call (resolution/device changes), never by the
+		// failure itself. In practice that meant one transient stall - most likely to
+		// happen exactly during the GPU-load spikes of a cell load, menu open, or fast
+		// camera turn - silently killed NR until something else happened to reset it.
+		//
+		// This makes the latch self-heal instead: after a cooldown, retry by doing a
+		// full Reset() (which re-initializes the interop/runtime from scratch) right
+		// before attempting the frame again, rather than requiring an external event.
+		// If it keeps failing immediately on every retry (kMaxAutoRetries in a row),
+		// stop auto-retrying and stay latched - at that point something is genuinely
+		// broken rather than transient, and hammering retries every couple of seconds
+		// would just be its own source of stutter.
+		bool RecoverFromLatchIfDue()
+		{
+			if (!failureLatched)
+				return true;
+			if (consecutiveFailures > kMaxAutoRetries)
+				return false;
+			if (std::chrono::steady_clock::now() - failureLatchedAt < kRetryCooldown)
+				return false;
+			logger::info("[DLSSNR] attempting automatic recovery after failure (attempt {}/{})",
+				consecutiveFailures, kMaxAutoRetries);
+			Reset();
+			return true;
+		}
+
+		static constexpr std::chrono::milliseconds kRetryCooldown{ 2000 };
+		static constexpr int kMaxAutoRetries = 5;
 
 		D3D12Interop interop;
 		Util::LazyShader<ID3D11ComputeShader> copyDepthGuideCS;
@@ -402,6 +445,8 @@ namespace NeuralRendering
 		std::array<EyeResources, 2> eyes;
 		std::array<bool, 2> resetPending{ true, true };
 		bool failureLatched = false;
+		std::chrono::steady_clock::time_point failureLatchedAt{};
+		int consecutiveFailures = 0;
 	};
 
 	Renderer::Renderer() : state_(new State()) {}

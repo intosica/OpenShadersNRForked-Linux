@@ -124,25 +124,44 @@ jobs:
         secrets:
             token: ${{ secrets.GITHUB_TOKEN }}
 
-    nexus-upload:
-        # Stable tags only. Proceeds whether THIS run attached artifacts or
-        # check-existing found them already attached by the chained build.
-        # secrets.UNEX_APIKEY != '' is a belt-and-suspenders guard: this job
-        # is already unreachable on branch/dispatch runs via the
-        # github.event_name == 'release' check below, but on forks (or a repo
-        # where Nexus credentials just haven't been configured yet) a real
-        # published release would otherwise still try to call the reusable
-        # upload workflow with an empty API key. Skip (not fail) instead.
-        name: Nexus Upload
+    check-nexus-creds:
+        # secrets can't be referenced directly in a job-level `if:` (that's
+        # exactly what broke run #15 -- "Unrecognized named-value: 'secrets'"
+        # invalidates the whole workflow file, not just this job). So the
+        # check happens in a real step instead, where `env:` can read the
+        # secret, and the result is published as a plain job output, which
+        # IS valid inside `if:`.
+        name: Check Nexus credentials
         needs: [check-existing, attach]
         if: >
             always() && !cancelled() &&
             github.event_name == 'release' &&
             github.event.action == 'published' &&
             !contains(github.event.release.tag_name, '-') &&
-            secrets.UNEX_APIKEY != '' &&
             (needs.attach.result == 'success' ||
              (needs.check-existing.result == 'success' && needs.check-existing.outputs.needs-build == 'false'))
+        runs-on: ubuntu-latest
+        outputs:
+            has-key: ${{ steps.check.outputs.has-key }}
+        steps:
+            - name: Check for UNEX_APIKEY
+              id: check
+              env:
+                  UNEX_APIKEY: ${{ secrets.UNEX_APIKEY }}
+              run: |
+                  if [ -n "$UNEX_APIKEY" ]; then
+                    echo "has-key=true" >> "$GITHUB_OUTPUT"
+                  else
+                    echo "has-key=false" >> "$GITHUB_OUTPUT"
+                    echo "::warning::UNEX_APIKEY is not set -- skipping Nexus upload."
+                  fi
+
+    nexus-upload:
+        # Credential/tag/event gating already happened in check-nexus-creds
+        # above; this job only needs to check that it said go-ahead.
+        name: Nexus Upload
+        needs: [check-nexus-creds]
+        if: always() && !cancelled() && needs.check-nexus-creds.outputs.has-key == 'true'
         uses: ./.github/workflows/nexus-upload.yaml
         with:
             tag: ${{ github.event.release.tag_name }}

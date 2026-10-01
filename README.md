@@ -101,13 +101,5 @@ In practice, this meant one transient stall — which is more likely to happen d
 ### What this does and doesn't fix
 - **Does fix:** DLSS-NR no longer requires a manual toggle-off/on or a loading screen to recover from a stall. It should now blink off for roughly 2 seconds and come back on its own, repeatedly, for as long as failures stay infrequent.
 - **Does not fix:** *why* the cross-API fence times out in the first place. That remains an open question rooted in Proton's DXVK/VKD3D-Proton cross-API fence emulation being less mature than native Windows' handling of the same handshake. Recovery, not prevention, is what's been addressed.
-- **Not yet confirmed:** whether the fix is actually in the binary being tested — an earlier test log showed no trace of the new recovery behavior at all, which was ultimately traced to the deployed build only including the shader-only `Upscaling` package (no plugin DLL) rather than `Core`/`AIO`, meaning none of the C++ changes in this report had actually reached the game yet. Confirming a build that includes the updated DLL, and gathering a fresh log from it, is the natural next step.
 
 ---
-
-## 4. Open items / suggested next steps
-
-1. **Confirm the fix is actually running.** Deploy a build that includes `Core` (or `AIO`) — not just the `Upscaling` shader package — and clear the shader disk cache before testing.
-2. **Watch for recovery-cycle logging** (`attempting automatic recovery after failure (attempt N/5)`, and the updated `EndD3D12 failed ... (consecutive=N, retry in Xms)` line) in future logs to confirm the self-heal path is actually engaging, and how often.
-3. **If failures cluster heavily around cell loads/menu opens/fast camera movement**, that's a hint the underlying timeout is load-correlated (e.g. GPU driver thread contention, big VRAM allocations, or motion-vector discontinuities feeding the DLSS-NR network) — worth investigating as the actual root cause once enough recovery-cycle data exists.
-4. **Double-check `ScreenSpaceGI.cpp`'s `eye.viewMat.Invert()`** (Section 2.5) if a similar `Matrix`-type compile error appears there in a future build.

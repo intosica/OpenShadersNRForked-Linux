@@ -1,0 +1,62 @@
+#include "Common/BRDF.hlsli"
+#include "Common/Color.hlsli"
+
+namespace GrassLighting
+{
+	float GetRainWetness()
+	{
+#if defined(WETNESS_EFFECTS)
+		return saturate(SharedData::wetnessEffectsSettings.Wetness * SharedData::wetnessEffectsSettings.MaxRainWetness);
+#else
+		return 0.0;
+#endif
+	}
+
+	float3 GetLightSpecularInput(float3 L, float3 V, float3 N, float3 lightColor, float roughness, float3 F0)
+	{
+		float3 H = normalize(V + L);
+#if defined(VANILLA_FRESNEL)
+		if (SharedData::vanillaFresnelSettings.Enable && SharedData::vanillaFresnelSettings.EnableGGXOnGrass) {
+			float NdotL = saturate(dot(N, L));
+			float NdotV = saturate(dot(N, V));
+			float NdotH = saturate(dot(N, H));
+			float VdotH = saturate(dot(V, H));
+
+			float D = BRDF::D_GGX(roughness, NdotH);
+			float G = BRDF::Vis_SmithJointApprox(roughness, NdotL, NdotV);
+			float3 F = BRDF::F_Schlick(F0, VdotH);
+			float3 specular = D * G * F;
+			return specular * lightColor * NdotL * Color::PBRLightingCompensation;
+		}
+#endif
+		float shininess = (1.0 - roughness) * 100.f;
+		float HdotN = saturate(dot(H, N));
+		float lightColorMultiplier = exp2(shininess * log2(HdotN));
+		return lightColor * lightColorMultiplier.xxx;
+	}
+
+	float3 TransformNormal(float3 normal)
+	{
+		return normal * 2 + -1.0.xxx;
+	}
+
+	// http://www.thetenthplanet.de/archives/1180
+	float3x3 CalculateTBN(float3 N, float3 p, float2 uv)
+	{
+		// get edge vectors of the pixel triangle
+		float3 dp1 = ddx_coarse(p);
+		float3 dp2 = ddy_coarse(p);
+		float2 duv1 = ddx_coarse(uv);
+		float2 duv2 = ddy_coarse(uv);
+
+		// solve the linear system
+		float3 dp2perp = cross(dp2, N);
+		float3 dp1perp = cross(N, dp1);
+		float3 T = dp2perp * duv1.x + dp1perp * duv2.x;
+		float3 B = dp2perp * duv1.y + dp1perp * duv2.y;
+
+		// construct a scale-invariant frame
+		float invmax = rsqrt(max(dot(T, T), dot(B, B)));
+		return float3x3(T * invmax, B * invmax, N);
+	}
+}

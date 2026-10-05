@@ -1,0 +1,98 @@
+# Posts published stable releases (full body) to the fork's Discord.
+# Pre-releases (RCs, dev-latest) and plain commits are intentionally silent.
+# Long content is split across multiple embeds so nothing is truncated.
+name: "Maint: Discord Notifications"
+on:
+    release:
+        types: [published]
+
+# Only reads the event payload and posts to Discord; no repo access needed.
+permissions:
+    contents: read
+
+jobs:
+    notify:
+        # Stable releases only — skip pre-releases (RCs, dev-latest).
+        if: ${{ github.event.release.prerelease == false }}
+        runs-on: "ubuntu-latest"
+        steps:
+            # Only .github/scripts is needed, to reuse strip_audit() from the
+            # Nexus changelog step rather than duplicating that regex here.
+            - uses: actions/checkout@v6
+              with:
+                  sparse-checkout: .github/scripts
+
+            - name: "Strip Feature Version Audit section"
+              id: strip-audit
+              env:
+                  RELEASE_BODY: ${{ github.event.release.body }}
+              run: |
+                  delimiter="EOF_$(uuidgen)"
+                  {
+                      echo "body<<$delimiter"
+                      python3 - << 'PYEOF'
+                  import os, sys
+                  sys.path.insert(0, ".github/scripts")
+                  from nexus_changelog import strip_audit
+                  print(strip_audit(os.environ.get("RELEASE_BODY", "")))
+                  PYEOF
+                      echo "$delimiter"
+                  } >> "$GITHUB_OUTPUT"
+
+            - name: "Post to Discord"
+              env:
+                  WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+                  RELEASE_TITLE: ${{ github.event.release.name }}
+                  RELEASE_TAG: ${{ github.event.release.tag_name }}
+                  RELEASE_URL: ${{ github.event.release.html_url }}
+                  RELEASE_BODY: ${{ steps.strip-audit.outputs.body }}
+              run: |
+                  set -euo pipefail
+
+                  # No webhook configured (e.g. forks without the secret): skip quietly.
+                  if [[ -z "${WEBHOOK:-}" ]]; then
+                      echo "DISCORD_WEBHOOK not set; skipping Discord notification."
+                      exit 0
+                  fi
+
+                  # Discord embed description hard limit is 4096; stay under it.
+                  LIMIT=4000
+                  TITLE="${RELEASE_TITLE:-$RELEASE_TAG}"
+                  URL="$RELEASE_URL"
+                  COLOR=3066993  # 0x2ecc71 green
+                  description="$RELEASE_BODY"
+
+                  # Continuation embeds carry no title/url so only the first links out.
+                  send_embed() {
+                      local desc="$1" title="$2" payload
+                      payload=$(jq -n --arg desc "$desc" --arg title "$title" --arg url "$URL" --argjson color "$COLOR" \
+                          '{username: "Open Shaders", embeds: [ ({description: $desc, color: $color}
+                              + (if $title != "" then {title: $title} else {} end)
+                              + (if $title != "" and $url != "" then {url: $url} else {} end)) ]}')
+                      curl -sf --retry 3 --retry-delay 2 --connect-timeout 5 --max-time 20 \
+                          -X POST -H "Content-Type: application/json" -d "$payload" "$WEBHOOK" >/dev/null
+                      sleep 1  # courtesy gap to avoid Discord rate limits
+                  }
+
+                  # An empty release body still announces the title + link.
+                  if [[ -z "$description" ]]; then
+                      send_embed "" "$TITLE"
+                      exit 0
+                  fi
+
+                  # Wrap over-long single lines at spaces so no line exceeds LIMIT.
+                  description="$(fold -s -w "$LIMIT" <<< "$description")"
+
+                  chunk=""
+                  first=1
+                  flush() {
+                      [[ -z "$chunk" ]] && return
+                      if (( first )); then send_embed "$chunk" "$TITLE"; first=0; else send_embed "$chunk" ""; fi
+                      chunk=""
+                  }
+
+                  while IFS= read -r line || [[ -n "$line" ]]; do
+                      if (( ${#chunk} + ${#line} + 1 > LIMIT )); then flush; fi
+                      if [[ -n "$chunk" ]]; then chunk="$chunk"$'\n'"$line"; else chunk="$line"; fi
+                  done <<< "$description"
+                  flush

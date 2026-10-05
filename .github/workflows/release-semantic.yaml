@@ -1,0 +1,371 @@
+name: "Release: Semantic Version"
+
+# Dispatch on: dev (RC) | main (stable, current line) | hotfix/X.Y.x
+# (any line, current or older — .releaserc.js scopes each hotfix branch
+# to its own release channel independently, uniformly).
+#
+# Promotion (ff_target on main): FF main to ff_target, run semantic-
+# release, then reconcile dev. Dev-source reconciles FF-only; hotfix-
+# staging source rebases dev onto the new main so the release tag
+# enters dev's ancestry — the only force-push this workflow performs.
+# `auto-rebase-prs.yaml` then rebases open PRs targeting dev.
+
+on:
+    workflow_dispatch:
+        inputs:
+            ff_target:
+                description: "Promotion mode: dev SHA to fast-forward main to before releasing. Leave empty for a normal release on the dispatched branch."
+                required: false
+                default: ""
+            skip_feature_bumps:
+                description: "Skip the automatic feature .ini version bumps (feature_version_audit.py --apply-bumps). Tick to bypass the bump algorithm and hand-manage feature versions for this release."
+                type: boolean
+                required: false
+                default: false
+
+permissions:
+    contents: write
+
+concurrency:
+    # Serialize promotions so two concurrent dispatches on main can't race
+    # against each other's FF pushes.
+    group: release-semantic-${{ github.ref_name }}
+    cancel-in-progress: false
+
+jobs:
+    # origin/main's tip is always a sound "last validated state" baseline: main only
+    # ever advances via this same validated-release-promotion path.
+    check-changes:
+        name: Check for shader/build changes since main
+        runs-on: ubuntu-latest
+        permissions:
+            contents: read
+        outputs:
+            hlsl-should-build: ${{ steps.check.outputs.hlsl-should-build }}
+        steps:
+            - uses: actions/checkout@v6
+              with:
+                  fetch-depth: 0
+
+            - name: Resolve baseline and target SHAs
+              id: resolve
+              env:
+                  TARGET_REF: ${{ inputs.ff_target || github.sha }}
+              run: |
+                  set -euo pipefail
+                  git fetch origin main "${TARGET_REF}"
+                  echo "main_sha=$(git rev-parse origin/main)" >> "$GITHUB_OUTPUT"
+                  echo "target_sha=$(git rev-parse "${TARGET_REF}")" >> "$GITHUB_OUTPUT"
+
+            - name: Check for build/shader changes
+              id: check
+              uses: ./.github/actions/check-build-changes
+              with:
+                  base-sha: ${{ steps.resolve.outputs.main_sha }}
+                  head-sha: ${{ steps.resolve.outputs.target_sha }}
+
+    # Gate the version cut on the release-parity shader validation the cache build
+    # enforces (/O3 + default-install profile), and produce the compiled binaries
+    # build-artifacts reuses below. Shader-only (no C++ build), so it adds
+    # zero PR-phase cost and runs once per release cut. Catches /O3-only warnings (e.g.
+    # X4000 uninitialized return) before semantic-release tags a version whose caches
+    # would then fail to build. Validates the about-to-be-released ref: ff_target in
+    # promotion mode, else the dispatched SHA.
+    # check-changes skip is binary, never partial: it either runs this full pass or none of it.
+    validate-shaders:
+        needs: check-changes
+        uses: ./.github/workflows/_shared-build.yaml
+        with:
+            ref: ${{ inputs.ff_target || github.sha }}
+            repository: ${{ github.repository }}
+            run-cpp: false
+            run-shader-validation: ${{ needs.check-changes.outputs.hlsl-should-build != 'false' }}
+            run-shader-tests: false
+            run-cpp-tests: false
+            release-parity-validation: true
+            # Info.ini (version-sensitive) is still finalized for real in
+            # build-artifacts below -- only the compile itself is reused.
+            upload-compiled-shaders: ${{ needs.check-changes.outputs.hlsl-should-build != 'false' }}
+            # Gate matches the shipped set only; the full-config pass is a PR concern.
+            run-full-config-validation: false
+
+    release:
+        needs: [validate-shaders, check-changes]
+        # An all-skipped validate-shaders (no shader/cmake/build-ci changes) reports
+        # "skipped", same as a failed check-changes blocking it -- check-changes must
+        # be checked directly here, not inferred from validate-shaders alone.
+        if: always() && !cancelled() && needs.check-changes.result == 'success' && needs.validate-shaders.result != 'failure'
+        runs-on: ubuntu-latest
+        outputs:
+            new-release-published: ${{ steps.semantic.outputs.new_release_published }}
+            new-release-tag: ${{ steps.semantic.outputs.new_release_git_tag }}
+        steps:
+            - name: Checkout repository
+              uses: actions/checkout@v6
+              with:
+                  fetch-depth: 0
+                  persist-credentials: false
+                  # Token used for the working checkout. The actual pushes
+                  # (FF main, semantic-release commit/tag, FF dev) all go
+                  # through RELEASE_PAT below so they can bypass branch
+                  # protection and fire downstream workflows.
+                  token: ${{ secrets.RELEASE_PAT }}
+
+            - name: Configure git identity
+              run: |
+                  git config user.name "github-actions[bot]"
+                  git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+            - name: Validate ff_target (promotion mode)
+              id: validate
+              if: ${{ inputs.ff_target != '' }}
+              env:
+                  FF_TARGET: ${{ inputs.ff_target }}
+              run: |
+                  set -euo pipefail
+                  if [[ '${{ github.ref_name }}' != 'main' ]]; then
+                    echo "::error::ff_target is only valid when this workflow is dispatched on 'main' (got '${{ github.ref_name }}')."
+                    exit 1
+                  fi
+                  # Fetch dev + every hotfix branch so the ancestor checks can
+                  # find ff_target regardless of which staging branch it's on.
+                  git fetch origin main dev '+refs/heads/hotfix/*:refs/remotes/origin/hotfix/*'
+                  if ! git rev-parse --verify "${FF_TARGET}^{commit}" >/dev/null 2>&1; then
+                    echo "::error::ff_target SHA ${FF_TARGET} does not exist."
+                    exit 1
+                  fi
+                  if ! git merge-base --is-ancestor origin/main "${FF_TARGET}"; then
+                    echo "::error::main is not an ancestor of ff_target ${FF_TARGET} — fast-forward is not possible."
+                    exit 1
+                  fi
+                  # Identify the source branch for the promotion.
+                  #   dev source     → FF-reconcile dev afterward (no rewrite).
+                  #   hotfix-staging → rebase-reconcile dev afterward so the
+                  #                    release commit + tag enter dev's
+                  #                    ancestry. Force-with-lease push; `git
+                  #                    rebase` drops patch-id duplicates of
+                  #                    the cherry-picks already on main.
+                  SOURCE=""
+                  if git merge-base --is-ancestor "${FF_TARGET}" origin/dev; then
+                    SOURCE="dev"
+                  else
+                    while read -r REF; do
+                      [[ -z "${REF}" ]] && continue
+                      if git merge-base --is-ancestor "${FF_TARGET}" "${REF}"; then
+                        SOURCE="${REF#origin/}"
+                        break
+                      fi
+                    done < <(git for-each-ref --format='%(refname:short)' 'refs/remotes/origin/hotfix/*')
+                  fi
+                  if [[ -z "${SOURCE}" ]]; then
+                    echo "::error::ff_target ${FF_TARGET} is not an ancestor of dev or any origin/hotfix/* branch — refusing to promote an unreviewed SHA."
+                    exit 1
+                  fi
+                  echo "source=${SOURCE}" >> "$GITHUB_OUTPUT"
+                  {
+                    echo "## Promotion plan"
+                    echo "- Source branch: \`${SOURCE}\`"
+                    echo "- Target SHA: \`$(git rev-parse --short=9 "${FF_TARGET}")\`"
+                    PRERELEASE_TAG=$(git tag --points-at "${FF_TARGET}" | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+-(rc|pr)[.0-9]+$' | head -n1 || true)
+                    echo "- Prerelease tag at target: \`${PRERELEASE_TAG:-<none>}\`"
+                    echo "- Commits being promoted ($(git rev-list --count "origin/main..${FF_TARGET}")):"
+                    echo ""
+                    # 4-space indent renders the commits as a code block under the preceding list item in GitHub-flavored markdown.
+                    git log --oneline "origin/main..${FF_TARGET}" | sed 's/^/    /'
+                  } >> "$GITHUB_STEP_SUMMARY"
+
+            - name: Fast-forward main to ff_target
+              if: ${{ inputs.ff_target != '' }}
+              env:
+                  TOKEN: ${{ secrets.RELEASE_PAT }}
+                  FF_TARGET: ${{ inputs.ff_target }}
+              run: |
+                  set -euo pipefail
+                  REMOTE="https://x-access-token:${TOKEN}@github.com/${{ github.repository }}.git"
+                  # FF-only push: --force-with-lease guards against concurrent
+                  # changes; if main moved we abort rather than overwrite.
+                  CURRENT_MAIN=$(git rev-parse origin/main)
+                  git push --force-with-lease="main:${CURRENT_MAIN}" "${REMOTE}" "${FF_TARGET}:refs/heads/main"
+                  # Re-point our local working tree at the new main tip so
+                  # semantic-release runs against the promoted history.
+                  git checkout -B main "${FF_TARGET}"
+
+            # Escape hatch: the audit runs from the dispatched branch here (not
+            # under pull_request_target), but a misfiring bump algorithm can still
+            # apply a wrong version. Tick skip_feature_bumps to hand-manage instead.
+            #
+            # Repo-relative output: the Semantic Release step below reads
+            # this file from the checkout to build the release notes.
+            - name: Apply feature version bumps
+              if: ${{ !inputs.skip_feature_bumps }}
+              run: |
+                  python tools/feature_version_audit.py \
+                    --apply-bumps \
+                    --output feature-audit-notes.md
+
+            # Blocking gate (PR check above is informative only): catches a
+            # misfiring bump algorithm or a gap left by skip_feature_bumps.
+            - name: Verify feature versions
+              run: |
+                  set +e
+                  python tools/feature_version_audit.py --ci --output feature-audit-verify.md
+                  EXIT_CODE=$?
+                  set -e
+                  cat feature-audit-verify.md
+                  exit $EXIT_CODE
+
+            - name: Semantic Release
+              id: semantic
+              uses: cycjimmy/semantic-release-action@v6
+              with:
+                  extra_plugins: |
+                      @google/semantic-release-replace-plugin
+                      @semantic-release/git
+                      @semantic-release/github
+                  tag_format: "v${version}"
+              env:
+                  # RELEASE_PAT required for two reasons:
+                  # 1. Allows pushing the version commit and tag to the protected
+                  #    target branch (GITHUB_TOKEN cannot bypass branch protection).
+                  # 2. A PAT-sourced tag push triggers downstream workflows
+                  #    (release-build.yaml); GITHUB_TOKEN pushes do not.
+                  GITHUB_TOKEN: ${{ secrets.RELEASE_PAT }}
+
+            - name: Reconcile dev with release commit (promotion mode, dev source only)
+              if: ${{ inputs.ff_target != '' && steps.semantic.outputs.new_release_published == 'true' && steps.validate.outputs.source == 'dev' }}
+              env:
+                  TOKEN: ${{ secrets.RELEASE_PAT }}
+              run: |
+                  set -euo pipefail
+                  git fetch origin main dev
+                  # Verify dev is still an ancestor of main — if someone pushed
+                  # to dev during the release, exit with a warning instead of
+                  # rewriting their work.
+                  if ! git merge-base --is-ancestor origin/dev origin/main; then
+                    {
+                      echo ""
+                      echo "## ⚠️ Dev reconcile skipped — dev moved during promotion"
+                      echo "Dev was pushed to during the release. To reconcile manually:"
+                      echo ""
+                      echo '```bash'
+                      echo "git fetch && git checkout dev && git merge --ff-only origin/main && git push"
+                      echo '```'
+                    } >> "$GITHUB_STEP_SUMMARY"
+                    # Fail loud: tag is on main but dev isn't reconciled
+                    # (same invariant break as the hotfix-staging path).
+                    echo "::error::dev moved during promotion — dev is unreconciled. See job summary for manual remediation."
+                    exit 1
+                  fi
+                  NEW_MAIN=$(git rev-parse origin/main)
+                  REMOTE="https://x-access-token:${TOKEN}@github.com/${{ github.repository }}.git"
+                  CURRENT_DEV=$(git rev-parse origin/dev)
+                  git push --force-with-lease="dev:${CURRENT_DEV}" "${REMOTE}" "${NEW_MAIN}:refs/heads/dev"
+                  echo "::notice::Reconciled dev to main ($NEW_MAIN)."
+
+            - name: Rebase-reconcile dev with release commit (promotion mode, hotfix-staging source)
+              if: ${{ inputs.ff_target != '' && steps.semantic.outputs.new_release_published == 'true' && steps.validate.outputs.source != 'dev' && steps.validate.outputs.source != '' }}
+              env:
+                  TOKEN: ${{ secrets.RELEASE_PAT }}
+              run: |
+                  set -euo pipefail
+                  git fetch origin main dev
+                  NEW_MAIN=$(git rev-parse origin/main)
+                  CURRENT_DEV=$(git rev-parse origin/dev)
+
+                  # FF-only won't work: dev and main diverged. Rebase
+                  # preserves linear history; patch-id dedup drops the
+                  # cherry-picked-fix commits automatically.
+                  git checkout -B dev "${CURRENT_DEV}"
+                  if ! git rebase "${NEW_MAIN}"; then
+                    git rebase --abort || true
+                    {
+                      echo ""
+                      echo "## ⚠️ Dev reconcile FAILED — manual intervention required"
+                      echo ""
+                      echo "Rebasing \`dev\` onto the new \`main\` (\`$(git rev-parse --short=9 "${NEW_MAIN}")\`) hit a conflict."
+                      echo "The hotfix release is live on \`main\`, but \`dev\` has NOT absorbed it."
+                      echo "Until reconciled, the next RC cut on \`dev\` will compute the wrong version floor."
+                      echo ""
+                      echo "**Recover by running locally:**"
+                      echo ""
+                      echo '```bash'
+                      echo "git fetch origin"
+                      echo "git checkout dev && git reset --hard origin/dev"
+                      echo "git rebase origin/main      # resolve conflicts, git rebase --continue"
+                      echo "git push --force-with-lease origin dev"
+                      echo '```'
+                    } >> "$GITHUB_STEP_SUMMARY"
+                    echo "::error::Dev rebase-reconcile failed — see job summary for remediation."
+                    exit 1
+                  fi
+
+                  REMOTE="https://x-access-token:${TOKEN}@github.com/${{ github.repository }}.git"
+                  # --force-with-lease guards against a concurrent push to
+                  # dev: if someone landed a commit during the release,
+                  # abort instead of overwriting their work.
+                  if ! git push --force-with-lease="dev:${CURRENT_DEV}" "${REMOTE}" "HEAD:refs/heads/dev"; then
+                    {
+                      echo ""
+                      echo "## ⚠️ Dev push rejected (lease check failed)"
+                      echo ""
+                      echo "Dev was pushed to during the release. Reconcile manually:"
+                      echo ""
+                      echo '```bash'
+                      echo "git fetch origin && git checkout dev && git reset --hard origin/dev"
+                      echo "git rebase origin/main && git push --force-with-lease origin dev"
+                      echo '```'
+                    } >> "$GITHUB_STEP_SUMMARY"
+                    # Fail loud: tag is on main but dev's history doesn't
+                    # contain it, so the next RC would compute its floor
+                    # and changelog against the wrong prior tag.
+                    echo "::error::Dev moved during release — dev is unreconciled. See job summary for manual remediation."
+                    exit 1
+                  fi
+
+                  {
+                    echo ""
+                    echo "## Dev reconciled (rebase-forward)"
+                    echo "- Source: hotfix-staging \`${{ steps.validate.outputs.source }}\`"
+                    echo "- New main: \`$(git rev-parse --short=9 "${NEW_MAIN}")\`"
+                    echo "- Dev rebased linearly onto new main; identical-patch commits auto-dropped by \`git rebase\`."
+                    echo "- Open PRs against dev are auto-rebased by the \`Auto-rebase open PRs\` workflow."
+                  } >> "$GITHUB_STEP_SUMMARY"
+                  echo "::notice::Reconciled dev onto main via rebase (linear history preserved)."
+
+    # Attaches real artifacts to the draft before a human publishes it.
+    # Publishing before this finishes races release-build.yaml's own
+    # fallback build -- wait for attach-artifacts to finish first.
+    build-artifacts:
+        needs: [release, check-changes]
+        # always()/!cancelled(): new-release-published reflects only the
+        # Semantic Release step, which can succeed even if a LATER step
+        # (dev reconciliation) fails the job's overall result.
+        if: always() && !cancelled() && needs.release.outputs.new-release-published == 'true'
+        uses: ./.github/workflows/_shared-build.yaml
+        with:
+            ref: ${{ needs.release.outputs.new-release-tag }}
+            repository: ${{ github.repository }}
+            cache-artifacts: true
+            run-full-config-validation: false
+            # Info.ini still finalizes fresh here (not skipped) -- only the
+            # compile validate-shaders already uploaded is reused.
+            reuse-compiled-shaders: ${{ needs.check-changes.outputs.hlsl-should-build != 'false' }}
+
+    attach-artifacts:
+        needs: [release, build-artifacts]
+        # cpp-built alone, not needs.build-artifacts.result: a
+        # shader-validation leg failing must not block attaching what DID build.
+        if: >
+            always() && !cancelled() &&
+            needs.release.outputs.new-release-published == 'true' &&
+            needs.build-artifacts.outputs.cpp-built == 'true'
+        permissions:
+            contents: write
+            id-token: write
+            attestations: write
+        uses: ./.github/workflows/_attach-release-artifacts.yaml
+        with:
+            tag: ${{ needs.release.outputs.new-release-tag }}
+            draft: "true"
+        secrets:
+            token: ${{ secrets.GITHUB_TOKEN }}

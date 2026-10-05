@@ -1,0 +1,133 @@
+// string and printing related helpers
+
+#pragma once
+#include <string_view>
+
+namespace Util
+{
+	std::string GetFormattedVersion(const REL::Version& version);
+
+	std::string DefinesToString(const std::vector<std::pair<const char*, const char*>>& defines);
+	std::string DefinesToString(const std::vector<D3D_SHADER_MACRO>& defines);
+
+	/**
+	 * @brief Normalizes a file path by replacing backslashes with forward slashes,
+	 *        removing redundant slashes, and converting all characters to lowercase.
+	 *
+	 * This function ensures that the file path uses consistent forward slashes
+	 * (`/`), eliminates consecutive slashes (`//`), and converts all characters
+	 * in the path to lowercase for case-insensitive comparisons.
+	 *
+	 * @param a_path The original file path to be normalized.
+	 * @return A normalized file path as a lowercase string with single forward slashes.
+	 */
+	std::string FixFilePath(const std::string& a_path);
+	std::string WStringToString(const std::wstring& wideString);
+
+	/**
+	 * Formats a float value as milliseconds, using 2 or 3 decimal places as appropriate.
+	 * Returns '0 ms' for exact zero values.
+	 */
+	std::string FormatMilliseconds(float ms);
+	/**
+	 * Formats a float value as microseconds, using 2 decimal places.
+	 * Returns '0 us' for exact zero values.
+	 */
+	std::string FormatMicroseconds(float us);
+	/**
+	 * Formats a float value as a percentage string with 1 decimal place.
+	 */
+	std::string FormatPercent(float percent);
+	/**
+	 * Formats a file size in bytes to a human-readable string (KB/MB).
+	 * @param bytes The file size in bytes
+	 * @return Formatted string like "1.2 MB" or "512 KB"
+	 */
+	std::string FormatFileSize(uint64_t bytes);
+	/**
+	 * Returns a human-readable string for the time elapsed since the given time point (e.g., '5s', '2m', '1h').
+	 */
+	std::string TimeAgoString(std::chrono::steady_clock::time_point last);
+
+	/**
+	 * Returns a human-readable string for the time elapsed since the given QueryPerformanceCounter time point (e.g., '5s', '2m', '1h').
+	 * Uses QueryPerformanceCounter for high-performance timing without std::chrono dependencies.
+	 *
+	 * @param lastTime LARGE_INTEGER timestamp from QueryPerformanceCounter
+	 * @param frequency LARGE_INTEGER frequency from QueryPerformanceFrequency
+	 * @return Formatted string showing time elapsed (e.g., "5s", "2m", "1h")
+	 */
+	std::string TimeAgoStringQPC(const LARGE_INTEGER& lastTime, const LARGE_INTEGER& frequency);
+
+	/**
+	 * Returns a human-readable string for the time elapsed since the given filesystem time point (e.g., '5s ago', '2m ago', '1h ago').
+	 * @param fileTime The filesystem time point to calculate time ago from
+	 * @return Formatted string showing time elapsed (e.g., "5s ago", "2m ago", "1h ago", or "Unknown" on error)
+	 */
+	std::string FormatTimeAgo(std::filesystem::file_time_type fileTime);
+
+	/**
+	 * Formats a duration given in milliseconds as HH:MM:SS.
+	 * Suitable for displaying long-running operation times (e.g. shader compilation).
+	 *
+	 * @param ms Duration in milliseconds. Fractional milliseconds are truncated.
+	 *           Non-finite (NaN/inf) or negative values are clamped to "00:00:00".
+	 *           Durations >= 24 hours display hours without limit (e.g., "125:34:56").
+	 * @return Formatted string like "00:02:35" or "00:00:00" for invalid inputs
+	 */
+	std::string FormatDuration(double ms);
+
+	/**
+	 * Formats a delta value with percentage difference for A/B test comparisons.
+	 * Returns a string like "+0.45 ms (+12.3%)" or "-0.23 ms (-8.1%)".
+	 *
+	 * @param a The first value (typically Variant A)
+	 * @param b The second value (typically Variant B)
+	 * @param threshold Minimum percentage difference to display (default 0.01 = 1%)
+	 * @return Formatted string showing delta and percentage difference
+	 */
+	std::string FormatDeltaWithPercent(float a, float b, float threshold = 0.01f);
+
+	/**
+	 * Calculates the percentage of a part relative to a total value.
+	 * Returns defaultValue if total is zero or negative.
+	 *
+	 * @param part The part value to calculate percentage for
+	 * @param total The total value to calculate percentage relative to
+	 * @param defaultValue Value to return if total is invalid (default 0.0f)
+	 * @return Percentage as a float (0.0f to 100.0f)
+	 */
+	float CalculatePercentage(float part, float total, float defaultValue = 0.0f);
+
+	/**
+	 * Calculates the cost per call (frame time per draw call).
+	 * Returns 0.0f if drawCalls is zero or negative.
+	 *
+	 * @param frameTime The frame time in milliseconds
+	 * @param drawCalls The number of draw calls
+	 * @return Cost per call in milliseconds
+	 */
+	float CalculateCostPerCall(float frameTime, float drawCalls);
+
+	/**
+	 * Calculates the "other" frame time (total frame time minus measured sum).
+	 *
+	 * @param totalFrameTime The total frame time
+	 * @param measuredSum The sum of all measured frame times
+	 * @return The remaining frame time not accounted for by measured components
+	 */
+	float CalculateOtherFrameTime(float totalFrameTime, float measuredSum);
+
+	/** Case-insensitive equality for two strings. */
+	bool IEquals(std::string_view a, std::string_view b);
+
+	/**
+	 * Returns the defines-based shader cache filename suffix for the given shader
+	 * defines string, or an empty string when definesStr is empty.  The suffix
+	 * has the form "_{:08X}" where the hex value is a 32-bit FNV-1a hash of the string.
+	 *
+	 * This matches the suffix logic used by SIE::SShaderCache::GetDiskPath so
+	 * that any code building a cache path by hand stays in sync.
+	 */
+	std::string GetShaderDefinesSuffix(const std::string& definesStr);
+}  // namespace Util

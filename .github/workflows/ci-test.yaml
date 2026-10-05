@@ -1,0 +1,99 @@
+# CI self-test harness for workflow / composite-action changes.
+#
+# WHY: pr-checks runs under pull_request_target, where the workflow
+# definitions AND composite actions resolve from the BASE branch. A PR
+# therefore can never exercise its own changes to a reusable workflow or a
+# composite action (e.g. .github/actions/setup-build-environment). Push a
+# branch under ci_test/** to run the full build/validation matrix from THAT
+# branch's ref, so CI-infrastructure changes are validated before they merge.
+#
+# Usage:
+#   git push origin <local-branch>:ci_test/<name>
+# then watch the "CI self-test" run. Delete the ci_test/* branch when done.
+#
+# SECURITY: triggered only by `push` (to ci_test/**) and manual
+# `workflow_dispatch`. Both are write-access-gated -- forks cannot push to this
+# repository's refs and cannot dispatch its workflows -- so this only ever runs
+# trusted, same-repo code; it does NOT use the pull_request_target trust
+# inversion that fork PRs require. The repository guard below skips it on forks.
+# Cache writes use an isolated key suffix (-ci-test) so a ci_test branch can
+# never poison the dev / main / PR build caches that production runs consume.
+name: "CI self-test"
+
+on:
+    push:
+        branches: [ci_test/**]
+    workflow_dispatch:
+
+permissions:
+    contents: read
+
+concurrency:
+    group: ci-test-${{ github.ref }}
+    cancel-in-progress: true
+
+jobs:
+    self-test:
+        # Same-repo only: never run on a fork that happens to carry this file.
+        if: github.repository == 'alandtse/open-shaders'
+        uses: ./.github/workflows/_shared-build.yaml
+        with:
+            ref: ${{ github.sha }}
+            repository: ${{ github.repository }}
+            run-cpp: true
+            run-shader-validation: true
+            run-shader-tests: true
+            run-cpp-tests: true
+            # Isolate this harness's build caches from production keys so a
+            # ci_test branch cannot poison dev / main / PR build caches.
+            cache-key-suffix: "-ci-test"
+
+    # pr-checks.yaml's "Post Prerelease from PR" and release-build.yaml's
+    # "Post Release" jobs call this composite directly and are themselves
+    # unreachable from their own PRs (same base-branch-resolution problem as
+    # above). dry-run:true skips the actual ncipollo call, so this validates
+    # the composite's steps run cleanly on a given runner OS (e.g. a runs-on
+    # migration) without creating or mutating a real release/tag.
+    post-release-dry-run:
+        if: github.repository == 'alandtse/open-shaders'
+        runs-on: ubuntu-latest
+        permissions:
+            contents: read
+        steps:
+            - name: Check out composite action
+              uses: actions/checkout@v6
+              with:
+                  sparse-checkout: .github/actions
+
+            - name: Dry-run publish-release composite
+              uses: ./.github/actions/publish-release
+              with:
+                  token: ${{ github.token }}
+                  tag: ci-test-dry-run
+                  name: "CI self-test dry run"
+                  body: "Dry-run self-test; no release is created."
+                  dry-run: "true"
+                  download-artifact: "false"
+
+    # Run the feature version audit from THIS branch's ref. pr-checks runs it
+    # under pull_request_target from the BASE branch, so a change to the audit
+    # algorithm itself (e.g. release-stage 0.x logic) can never be exercised by
+    # its own PR. Push the change to ci_test/** to verify the verdict here first.
+    feature-audit:
+        if: github.repository == 'alandtse/open-shaders'
+        runs-on: ubuntu-latest
+        permissions:
+            contents: read
+        steps:
+            - uses: actions/checkout@v6
+              with:
+                  fetch-depth: 0
+            - uses: actions/setup-python@v6
+              with:
+                  python-version: "3.11"
+            - name: Run feature version audit (this branch vs dev)
+              run: |
+                  set -euo pipefail
+                  git fetch origin dev
+                  python tools/feature_version_audit.py --pr-check --ci \
+                    --base "$(git rev-parse origin/dev)" --head "${{ github.sha }}"

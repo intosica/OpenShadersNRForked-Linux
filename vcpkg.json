@@ -1,0 +1,76 @@
+{
+    "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+    "name": "communityshaders",
+    "license": "GPL-3.0",
+    "features": {
+        "commonlibsse-ng": {
+            "description": "Dependencies of clib-ng",
+            "dependencies": ["catch2", "fmt", "directxtk", "rapidcsv", "spdlog"]
+        },
+        "devbench-bridge": {
+            "description": "Register the plugin's tools into the devbench test bench (selected by the DEVBENCH_BRIDGE CMake option).",
+            "dependencies": ["devbench-api"]
+        }
+    },
+    "default-features": ["commonlibsse-ng"],
+    "dependencies": [
+        "bshoshany-thread-pool",
+        "clib-util",
+        "cppwinrt",
+        "directx-headers",
+        "directxtex",
+        "effects11",
+        "eastl",
+        "efsw",
+        "exprtk",
+        {
+            "name": "imgui",
+            "features": ["dx11-binding", "win32-binding", "docking-experimental"]
+        },
+        "magic-enum",
+        "detours",
+        "nlohmann-json",
+        "pystring",
+        "renderdoc",
+        "stb",
+        "xxhash",
+        {
+            "name": "tracy",
+            "features": ["on-demand"]
+        },
+        "unordered-dense",
+        "xbyak"
+    ],
+    "overrides": [
+        {
+            "name": "bshoshany-thread-pool",
+            "version": "5.1.0"
+        },
+        {
+            "name": "detours",
+            "version": "4.0.1",
+            "port-version": 8
+        },
+        {
+            "name": "eabase",
+            "version": "2025-08-01"
+        },
+        {
+            "name": "eastl",
+            "version": "3.27.1"
+        },
+        {
+            "name": "imgui",
+            "version": "1.92.6"
+        },
+        {
+            "name": "tracy",
+            "version-string": "0.14.1"
+        },
+        {
+            "name": "directx-headers",
+            "version": "1.614.1"
+        }
+    ],
+    "builtin-baseline": "dddca6fa87f177e0678e2545c4b4636a44aa05bd"
+}

@@ -1,0 +1,278 @@
+name: "PR: Checks"
+
+on:
+    # `paths` is restricted to files that pr-checks can actually validate on
+    # this PR. Workflow definitions (.github/workflows/**) and composite
+    # actions (.github/actions/**) resolve from the BASE branch under
+    # pull_request_target, so they can never be tested by their own PR's
+    # run — keeping them in `paths` would only fire the unconditional
+    # feature-audit job for changes that have no validatable impact.
+    pull_request_target:
+        types: [opened, synchronize, reopened, ready_for_review]
+        paths:
+            - "**.cpp"
+            - "**.h"
+            - "**.hpp"
+            - "**.c"
+            - "**.hlsl"
+            - "**.hlsli"
+            - "**.ini"
+            - "CMakeLists.txt"
+            - "CMakePresets.json"
+            - "vcpkg.json"
+            - "vcpkg-configuration.json"
+            - ".gitmodules"
+            - "extern/**"
+            - "cmake/**"
+            - "features/**"
+            - "src/Features/**"
+            - "package/Shaders/**"
+            - "tests/shaders/**"
+            - ".github/configs/**"
+
+# Least-privilege defaults; individual jobs override where needed.
+permissions:
+    contents: read
+    pull-requests: read
+
+concurrency:
+    group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+    cancel-in-progress: true
+
+jobs:
+    check-changes:
+        name: Check for changes in PRs
+        runs-on: ubuntu-latest
+        # Workflow/action file changes never affect this same PR under
+        # pull_request_target (base-branch resolution) -- only take effect next PR.
+        outputs:
+            should-build: ${{ steps.check.outputs.should-build }}
+            hlsl-should-build: ${{ steps.check.outputs.hlsl-should-build }}
+            shader-tests-should-build: ${{ steps.check.outputs.shader-tests-should-build }}
+            cpp-tests-should-build: ${{ steps.check.outputs.cpp-tests-should-build }}
+            changed-files-json: ${{ steps.check.outputs.changed-files-json }}
+        steps:
+            - uses: actions/checkout@v6
+              with:
+                  fetch-depth: 0
+
+            - name: Fetch PR head and base
+              run: |
+                  git fetch origin refs/pull/${{ github.event.pull_request.number }}/head
+                  git fetch origin ${{ github.event.pull_request.base.sha }}
+
+            - name: Check for build/shader changes
+              id: check
+              uses: ./.github/actions/check-build-changes
+              with:
+                  base-sha: ${{ github.event.pull_request.base.sha }}
+                  head-sha: ${{ github.event.pull_request.head.sha }}
+
+    # Security: this job compiles untrusted fork code.
+    # It uses _shared-build.yaml which enforces permissions: contents: read and receives NO secrets.
+    # The absence of a `secrets:` block here is intentional — passing secrets to a reusable
+    # workflow from pull_request_target triggered by a fork causes GitHub to reject the
+    # entire workflow file at parse time (0 jobs, "workflow file issue").
+    build:
+        name: Build (PR)
+        needs: [check-changes]
+        if: >
+            always() && !cancelled() &&
+            !github.event.pull_request.draft
+        uses: ./.github/workflows/_shared-build.yaml
+        with:
+            ref: ${{ github.event.pull_request.head.sha }}
+            repository: ${{ github.event.pull_request.head.repo.full_name }}
+            run-cpp: ${{ needs.check-changes.outputs.should-build != 'false' }}
+            run-shader-validation: ${{ needs.check-changes.outputs.hlsl-should-build != 'false' }}
+            run-shader-tests: ${{ needs.check-changes.outputs.shader-tests-should-build != 'false' }}
+            run-cpp-tests: ${{ needs.check-changes.outputs.cpp-tests-should-build != 'false' }}
+            hlsl-should-build: ${{ needs.check-changes.outputs.hlsl-should-build || 'true' }}
+            shader-tests-should-build: ${{ needs.check-changes.outputs.shader-tests-should-build || 'true' }}
+            cpp-tests-should-build: ${{ needs.check-changes.outputs.cpp-tests-should-build || 'true' }}
+            changed-files-json: ${{ needs.check-changes.outputs.changed-files-json }}
+            # Also run the release-parity pass (/O3 + profile) incrementally, so /O3-only
+            # warnings (e.g. X4000) that would break the release cache are caught pre-merge.
+            # run-full-config-validation stays on, so PRs cover both sets.
+            release-parity-validation: true
+            # Mild optimization (no LTCG) for faster CI; releases keep ALL.
+            # Non-fork PRs now save their own PR-preset cache generation.
+            cmake-preset: PR
+
+    # Security: this job has GITHUB_TOKEN write permissions but executes no fork
+    # code. It sparse-checks-out the BASE branch (trusted) for the
+    # publish-release composite and downloads the build job's pre-built artifacts.
+    prerelease:
+        name: Post Prerelease from PR
+        needs: [build]
+        if: >
+            always() && !cancelled() &&
+            needs.build.outputs.cpp-built == 'true'
+        # No compilation here: artifact download + gh/jq notes + the
+        # publish-release composite. release-dev.yaml's equivalent job
+        # already runs this exact shape on ubuntu-latest.
+        runs-on: ubuntu-latest
+        permissions:
+            contents: write
+            pull-requests: write
+        steps:
+            # Sparse-checkout only the composite action. Under
+            # pull_request_target the default ref is the BASE branch, so this
+            # introduces no fork code into this write-token job.
+            - name: Check out composite action
+              uses: actions/checkout@v6
+              with:
+                  sparse-checkout: .github/actions
+
+            - name: Download dist artifacts
+              uses: actions/download-artifact@v7
+              with:
+                  name: dist-artifacts
+                  path: dist/
+
+            - name: Generate release notes comparing against base version tag
+              id: gen_notes
+              continue-on-error: true
+              env:
+                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+              shell: bash
+              run: |
+                  TAG="v${{ needs.build.outputs.version }}-pr${{ github.event.pull_request.number }}"
+                  REPO="${{ github.repository }}"
+                  BASE_SHA="${{ github.event.pull_request.base.sha }}"
+                  HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+                  PR_NUMBER="${{ github.event.pull_request.number }}"
+                  PR_URL="https://github.com/$REPO/pull/$PR_NUMBER"
+
+                  if PR_AUTHOR=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json author -q '.author.login' 2>/dev/null); then
+                    echo "✅ Found PR author: $PR_AUTHOR"
+                  else
+                    PR_AUTHOR="${{ github.event.pull_request.user.login }}"
+                    echo "⚠️ Using fallback PR author: $PR_AUTHOR"
+                  fi
+
+                  echo "🔍 Comparing $BASE_SHA...$HEAD_SHA"
+
+                  if NOTES=$(gh api repos/$REPO/compare/$BASE_SHA...$HEAD_SHA 2>/dev/null | jq -r --arg author "$PR_AUTHOR" '
+                    .commits[]
+                    | "- \(.commit.message | split("\n")[0]) by @\(.author.login // $author)"
+                  ' 2>/dev/null) && [[ -n "$NOTES" ]]; then
+                    echo "$NOTES" > release-notes.md
+                    echo -e "\n[View Pull Request]($PR_URL)" >> release-notes.md
+                    echo "notes_generated=true" >> "$GITHUB_OUTPUT"
+                    echo "✅ Generated custom release notes"
+                  else
+                    echo "⚠️ Failed to generate notes from commit diff. Will use GitHub autogeneration." >&2
+                    echo "notes_generated=false" >> "$GITHUB_OUTPUT"
+                  fi
+
+            - name: Upload prerelease (custom notes)
+              if: steps.gen_notes.outputs.notes_generated == 'true'
+              uses: ./.github/actions/publish-release
+              with:
+                  token: ${{ secrets.GITHUB_TOKEN }}
+                  name: "Open Shaders ${{ needs.build.outputs.version }} PR #${{ github.event.pull_request.number }}"
+                  tag: v${{ needs.build.outputs.version }}-pr${{ github.event.pull_request.number }}
+                  # Anchor the preview tag to the PR head, not the base tip.
+                  # Without this, pull_request_target makes GITHUB_SHA the base
+                  # (dev) commit, so the tag lands in dev's history. A PR that
+                  # bumped CMake VERSION (e.g. a breaking change to 2.0.0) would
+                  # then expose a higher reachable version tag and poison
+                  # semantic-release's floor for every RC cut from dev.
+                  commit: ${{ github.event.pull_request.head.sha }}
+                  prerelease: true
+                  artifacts: "${{ github.workspace }}/dist/CommunityShaders_AIO-*.7z"
+                  body-file: release-notes.md
+                  download-artifact: "false"
+
+            - name: Upload prerelease (auto-generated notes)
+              if: steps.gen_notes.outputs.notes_generated != 'true'
+              uses: ./.github/actions/publish-release
+              with:
+                  token: ${{ secrets.GITHUB_TOKEN }}
+                  name: "Open Shaders ${{ needs.build.outputs.version }} PR #${{ github.event.pull_request.number }}"
+                  tag: v${{ needs.build.outputs.version }}-pr${{ github.event.pull_request.number }}
+                  # Anchor to the PR head, not the base tip — see the custom-notes
+                  # step above for why dev-reachable preview tags break releases.
+                  commit: ${{ github.event.pull_request.head.sha }}
+                  prerelease: true
+                  artifacts: "${{ github.workspace }}/dist/CommunityShaders_AIO-*.7z"
+                  generate-release-notes: "true"
+                  download-artifact: "false"
+
+            - name: Comment on PR
+              if: success()
+              uses: thollander/actions-comment-pull-request@24bffb9b452ba05a4f3f77933840a6a841d1b32b # v3
+              with:
+                  mode: upsert
+                  comment-tag: prerelease-build
+                  message: |
+                      ✅ A pre-release build is available for this PR:
+                      [Download](https://github.com/${{ github.repository }}/releases/tag/v${{ needs.build.outputs.version }}-pr${{ github.event.pull_request.number }})
+
+    feature-audit-pr:
+        name: Feature Version Audit (PR)
+        runs-on: ubuntu-latest
+        permissions:
+            contents: read
+        steps:
+            - name: Checkout code
+              uses: actions/checkout@v6
+              with:
+                  fetch-depth: 0
+                  submodules: recursive
+
+            - name: Setup Python
+              uses: actions/setup-python@v6
+              with:
+                  python-version: "3.11"
+
+            - name: Fetch PR head and base
+              run: |
+                  git fetch origin refs/pull/${{ github.event.pull_request.number }}/head:refs/pr_head
+                  git fetch origin ${{ github.event.pull_request.base.sha }}
+
+            - name: Run feature version audit (PR check)
+              id: audit
+              run: |
+                  # Informative only -- release-semantic.yaml's post-bump
+                  # step is the actual blocking gate.
+                  python tools/feature_version_audit.py --pr-check --base ${{ github.event.pull_request.base.sha }} --head refs/pr_head > pr-feature-audit.md
+                  cat pr-feature-audit.md
+
+            - name: Upload feature audit markdown (PR)
+              if: always()
+              uses: actions/upload-artifact@v7
+              with:
+                  name: pr-feature-audit
+                  path: pr-feature-audit.md
+
+    feature-audit-pr-comment:
+        name: Comment on PR with audit results
+        if: always() && (needs.feature-audit-pr.result == 'success' || needs.feature-audit-pr.result == 'failure')
+        needs: feature-audit-pr
+        runs-on: ubuntu-latest
+        permissions:
+            pull-requests: write
+        steps:
+            - name: Download feature audit markdown (PR)
+              continue-on-error: true
+              uses: actions/download-artifact@v7
+              with:
+                  name: pr-feature-audit
+                  path: .
+
+            - name: Create fallback audit markdown
+              if: ${{ hashFiles('pr-feature-audit.md') == '' }}
+              shell: bash
+              run: |
+                  cat > pr-feature-audit.md <<'EOF'
+                  ⚠️ Feature version audit did not produce a report. Check the `Feature Version Audit (PR)` job logs.
+                  EOF
+
+            - name: Comment on PR with audit results
+              uses: thollander/actions-comment-pull-request@24bffb9b452ba05a4f3f77933840a6a841d1b32b # v3
+              with:
+                  file-path: pr-feature-audit.md
+                  mode: upsert
+                  comment-tag: feature-version-audit

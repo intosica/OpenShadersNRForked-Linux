@@ -1,0 +1,175 @@
+diff -ru a/src/ShaderCache.cpp b/src/ShaderCache.cpp
+--- a/src/ShaderCache.cpp	2026-10-04 23:08:57.620644251 -0500
++++ b/src/ShaderCache.cpp	2026-10-04 23:09:25.294790839 -0500
+@@ -3101,8 +3101,17 @@
+ 	static bool RemoveCachePath(const std::filesystem::path& path, std::string_view label)
+ 	{
+ 		std::error_code ec;
+-		std::filesystem::remove_all(path, ec);
+-		if (ec) {
++		// Under Wine/Proton on Linux mounts, remove_all can transiently fail with
++		// "Directory is not empty" (delete-pending files, slow external drives).
++		// Retry briefly before giving up so a full wipe actually completes.
++		for (int attempt = 0; attempt < 5; ++attempt) {
++			ec.clear();
++			std::filesystem::remove_all(path, ec);
++			if (!ec || !std::filesystem::exists(path))
++				break;
++			std::this_thread::sleep_for(std::chrono::milliseconds(200));
++		}
++		if (ec && std::filesystem::exists(path)) {
+ 			logger::error("Failed to remove {} shader cache path {}: {}", label, Util::WStringToString(path.wstring()), ec.message());
+ 			return false;
+ 		}
+@@ -3204,11 +3213,14 @@
+ 		return ok;
+ 	}
+ 
+-	void ShaderCache::DeleteActiveDiskCache()
++	bool ShaderCache::DeleteActiveDiskCache()
+ 	{
+ 		std::scoped_lock lock{ compilationSet.compilationMutex };
+-		if (RemoveCachePath(DiskCachePath(), "active"))
++		if (RemoveCachePath(DiskCachePath(), "active")) {
+ 			logger::info("Deleted active disk cache");
++			return true;
++		}
++		return false;
+ 	}
+ 
+ 	void ShaderCache::DeleteDiskCacheFiles()
+@@ -3451,7 +3463,19 @@
+ 			WriteDiskCacheInfo();
+ 			PruneOrphanedShaderCacheEntries();
+ 		} else {
+-			DeleteActiveDiskCache();
++			if (DeleteActiveDiskCache()) {
++				// Stamp the fresh (now empty) cache with the current plugin/feature state
++				// immediately. Blobs are written to disk one by one as they compile, but
++				// Info.ini used to be written only after the WHOLE boot compile finished.
++				// If the game was closed before that (very common under Proton, where a
++				// full rebuild can take hours), the next boot saw "no plugin version found",
++				// wiped everything again, and the rebuild could never complete. With the
++				// info written now, the next boot validates and keeps every finished blob.
++				WriteDiskCacheInfo();
++			} else {
++				logger::warn("Active shader cache could not be fully deleted; compile progress will NOT be kept across restarts. "
++							 "Close the game and delete Data\\ShaderCache manually (check your mod manager's overwrite folder too).");
++			}
+ 		}
+ 	}
+ 
+@@ -3646,6 +3670,33 @@
+ 		return value == "1" || value == "true";
+ 	}
+ 
++	void ShaderCache::LogCompilerEnvironment()
++	{
++		const auto wineVersion = Util::GetWineVersion();
++		HMODULE compiler = GetModuleHandleW(L"d3dcompiler_47.dll");
++		wchar_t modulePath[MAX_PATH] = {};
++		if (compiler)
++			GetModuleFileNameW(compiler, modulePath, MAX_PATH);
++		const auto compilerVersion = compiler ? Util::GetDllVersion(modulePath) : std::nullopt;
++		const std::string compilerPathStr = compiler ? Util::WStringToString(modulePath) : std::string("<not loaded>");
++		const std::string compilerVersionStr = compilerVersion ? compilerVersion->string() : std::string("unknown");
++
++		if (!wineVersion) {
++			logger::info("Shader compiler: {} (version {})", compilerPathStr, compilerVersionStr);
++			return;
++		}
++
++		const bool builtin = Util::IsWineBuiltinModule(compiler);
++		logger::info("Running under Wine/Proton {} | shader compiler: {} (version {}, {})", *wineVersion,
++			compilerPathStr, compilerVersionStr, builtin ? "Wine BUILTIN" : "native Microsoft");
++		if (builtin) {
++			logger::warn("Wine's built-in d3dcompiler_47 is being used to compile shaders. It is far slower than the "
++						 "Microsoft compiler on Open Shaders' large Lighting/Effect shaders (a full rebuild can take hours) "
++						 "and may miscompile some permutations. Install the native compiler into this prefix, e.g. "
++						 "`protontricks 489830 d3dcompiler_47` (Skyrim SE), and make sure the DLL override is native,builtin.");
++		}
++	}
++
+ 	ShaderCache::ShaderCache()
+ 	{
+ 		// Env var is available at process start, so it works even when the saved
+@@ -3657,6 +3708,7 @@
+ 		}
+ 
+ 		dependencyTracker = std::make_unique<ShaderFileDependencyTracker>();
++		LogCompilerEnvironment();
+ 		logger::debug("ShaderCache initialized: {} startup threads, {} background threads, {} pool threads",
+ 			(int)compilationThreadCount, (int)backgroundCompilationThreadCount, (int)compilationPool.get_thread_count());
+ 		// Management thread runs on a dedicated jthread, not in the compilation pool,
+diff -ru a/src/ShaderCache.h b/src/ShaderCache.h
+--- a/src/ShaderCache.h	2026-10-04 23:08:57.620756702 -0500
++++ b/src/ShaderCache.h	2026-10-04 23:09:25.292399521 -0500
+@@ -1134,7 +1134,8 @@
+ 		void ManageCompilationSet(std::stop_token stoken);
+ 		void ProcessCompilationSet(std::stop_token stoken, SIE::ShaderCompilationTask task);
+ 		bool BackupActiveDiskCache();
+-		void DeleteActiveDiskCache();
++		bool DeleteActiveDiskCache();
++		void LogCompilerEnvironment();
+ 		void RefreshPreviousDiskCacheInfo();
+ 
+ 		~ShaderCache();
+diff -ru a/src/Utils/WinApi.cpp b/src/Utils/WinApi.cpp
+--- a/src/Utils/WinApi.cpp	2026-10-04 23:08:57.622163073 -0500
++++ b/src/Utils/WinApi.cpp	2026-10-04 23:09:34.066045003 -0500
+@@ -1,4 +1,5 @@
+ #include "WinApi.h"
++#include <cstring>
+ 
+ namespace Util
+ {
+@@ -69,4 +70,26 @@
+ 		}();
+ 		return cached;
+ 	}
++
++	std::optional<std::string> GetWineVersion()
++	{
++		const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
++		if (!ntdll)
++			return std::nullopt;
++		using WineGetVersionFn = const char*(__cdecl*)();
++		const auto fn = reinterpret_cast<WineGetVersionFn>(GetProcAddress(ntdll, "wine_get_version"));
++		if (!fn)
++			return std::nullopt;
++		const char* version = fn();
++		return std::string(version ? version : "unknown");
++	}
++
++	bool IsWineBuiltinModule(HMODULE a_module)
++	{
++		if (!a_module)
++			return false;
++		static constexpr char kBuiltinSignature[] = "Wine builtin DLL";
++		const auto* base = reinterpret_cast<const char*>(a_module);
++		return std::memcmp(base + 0x40, kBuiltinSignature, sizeof(kBuiltinSignature) - 1) == 0;
++	}
+ }  // namespace Util
+diff -ru a/src/Utils/WinApi.h b/src/Utils/WinApi.h
+--- a/src/Utils/WinApi.h	2026-10-04 23:08:57.622173433 -0500
++++ b/src/Utils/WinApi.h	2026-10-04 23:09:06.466001281 -0500
+@@ -20,4 +20,19 @@
+ 	 * @return The logical processor count for performance cores.
+ 	 */
+ 	uint32_t GetPerformanceCoreCount();
++
++	/**
++	 * @brief Wine/Proton version string if running under Wine, std::nullopt on native Windows.
++	 *
++	 * Uses ntdll's wine_get_version export, which only Wine provides.
++	 */
++	std::optional<std::string> GetWineVersion();
++
++	/**
++	 * @brief True if a loaded module is one of Wine's built-in DLL implementations
++	 * (as opposed to a native Microsoft DLL installed into the prefix).
++	 *
++	 * Wine stamps "Wine builtin DLL" into the DOS header area of its built-in PE modules.
++	 */
++	bool IsWineBuiltinModule(HMODULE a_module);
+ }  // namespace Util
